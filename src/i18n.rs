@@ -226,7 +226,10 @@ mod tests {
             "SyncApp.state.signedOut.title"
         );
         // The post-sync Stash CTA key must resolve to real text, not the raw key.
-        assert_eq!(__translate("SyncApp.action.viewStash", &[]), "View your stash");
+        assert_eq!(
+            __translate("SyncApp.action.viewStash", &[]),
+            "View your stash"
+        );
         // Named placeholder interpolation (%{var}) works end to end.
         assert_eq!(
             __translate(

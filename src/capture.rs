@@ -635,8 +635,7 @@ fn update_observed_stats(
             // Emit only the first few hits as events; the counters and
             // last_http1_* fields keep tracking everything.
             if (has_embark_host || has_bearer)
-                && stats.http1_embark_hosts.max(stats.http1_bearer_headers)
-                    <= MAX_HTTP_DEBUG_EVENTS
+                && stats.http1_embark_hosts.max(stats.http1_bearer_headers) <= MAX_HTTP_DEBUG_EVENTS
             {
                 let host = field_str(message, "host").unwrap_or_else(|| "(no host)".to_string());
                 let method = field_str(message, "method").unwrap_or_default();
@@ -1117,8 +1116,7 @@ mod tests {
             insert_str(&mut fields, "path", "/v1/x");
             fields.insert("has_embark_host", FieldValue::Bool(true));
             fields.insert("has_bearer", FieldValue::Bool(true));
-            let message =
-                parsed_message("embark_http_observation", 7, Direction::ToServer, fields);
+            let message = parsed_message("embark_http_observation", 7, Direction::ToServer, fields);
             update_observed_stats(&mut stats, &message, &tx, &mut embark_connections);
         }
 

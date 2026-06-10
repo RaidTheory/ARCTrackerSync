@@ -753,8 +753,14 @@ mod tests {
         let file_path = temp_dir.join("keys.log");
         fs::write(&file_path, b"CLIENT_RANDOM ...").expect("write file");
 
-        assert!(!sync_key_override_usable(&temp_dir), "directory is not usable");
-        assert!(sync_key_override_usable(&file_path), "existing file is usable");
+        assert!(
+            !sync_key_override_usable(&temp_dir),
+            "directory is not usable"
+        );
+        assert!(
+            sync_key_override_usable(&file_path),
+            "existing file is usable"
+        );
         assert!(
             !sync_key_override_usable(&temp_dir.join("missing.log")),
             "nonexistent path is not usable"
