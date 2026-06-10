@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Margin, RichText, Stroke};
+use eframe::egui::{
+    self, pos2, vec2, Align, Color32, CornerRadius, Frame, Layout, Rect, RichText, Sense, Stroke,
+    UiBuilder,
+};
 
 use crate::auth_bridge;
 use crate::capture::{self, CaptureEvent, CaptureHandle, CaptureStats, InterfaceInfo};
@@ -18,17 +21,19 @@ use crate::launch::{self, LauncherPlatform, LauncherStatus};
 use crate::single_instance;
 use crate::sync_client::{self, SubmitError, SubmitResponse, BASE_URL};
 use crate::theme::{
-    self, apply_arc_theme, arc_bg, arc_border, arc_card, arc_foreground, arc_muted_text,
-    arc_primary, arc_success, arc_warning,
+    self, apply_arc_theme, arc_bg, arc_border, arc_border_soft, arc_border_strong, arc_fg_dim,
+    arc_foreground, arc_input, arc_muted_text, arc_primary, arc_success, arc_titlebar, arc_warning,
 };
 use crate::token::TokenObservation;
 use crate::tr;
 use crate::tray::{self, TrayCommand, TrayCommandHandler, TrayController};
 use crate::updater::{self, InstallProgress, ReleaseInfo};
 use crate::widgets::{
-    card, clickable_pill, launcher_segment, link_button, pill, primary_button, progress_stage,
-    screen_header, secondary_button, settings_section, spinner_row, stage, status_dot, toggle_row,
-    StageState,
+    arc_modal, back_button, clickable_pill, hairline, icon_tile, inline_check, launcher_segment,
+    link_button, mono_eyebrow, pill, primary_button, refresh_badge, resize_handles,
+    secondary_button, secondary_button_full, settings_button, settings_card, settings_row,
+    spinner_row, stage, toggle_switch, tone_card, top_glow, vertical_stepper, window_button,
+    StageState, StepperNode, WindowButton,
 };
 
 type AuthResult = Result<String, String>;
@@ -83,7 +88,10 @@ enum UpdateState {
     /// No newer release known (or we're between checks).
     Idle,
     Available,
-    Downloading { received: u64, total: Option<u64> },
+    Downloading {
+        received: u64,
+        total: Option<u64>,
+    },
     Verifying,
     Installing,
     Relaunching,
@@ -208,6 +216,9 @@ pub struct ArcTrackerSyncApp {
     screen: Screen,
     show_activity_log: bool,
     show_explainer: bool,
+    /// Last measured hero-content height, used to vertically center the hub's
+    /// right panel without an ahead-of-time measure pass.
+    hero_content_height: f32,
 
     interfaces: Vec<InterfaceInfo>,
     selected_interface_index: usize,
@@ -373,6 +384,7 @@ impl ArcTrackerSyncApp {
             screen: Screen::Hub,
             show_activity_log: false,
             show_explainer: false,
+            hero_content_height: 0.0,
             interfaces: Vec::new(),
             selected_interface_index: 0,
             sync_key_source: sync_key_result
@@ -962,6 +974,34 @@ impl ArcTrackerSyncApp {
         }
     }
 
+    /// Which of the four stepper phases (0..=3)
+    fn hub_phase(state: HubState) -> usize {
+        match state {
+            HubState::NeedsAdmin | HubState::SignedOut | HubState::SigningIn => 0,
+            HubState::SelectGame
+            | HubState::PrepareLauncher
+            | HubState::PreparingLauncher
+            | HubState::CloseLauncher
+            | HubState::NeedsLauncher => 1,
+            HubState::LauncherReady | HubState::Connecting => 2,
+            HubState::Updating
+            | HubState::Synced
+            | HubState::SyncedIdle
+            | HubState::NeedsAttention => 3,
+        }
+    }
+
+    /// States that are actively waiting on background work
+    fn is_busy(state: HubState) -> bool {
+        matches!(
+            state,
+            HubState::SigningIn
+                | HubState::PreparingLauncher
+                | HubState::Connecting
+                | HubState::Updating
+        )
+    }
+
     fn progress_stages(&self, state: HubState) -> [(String, StageState); 4] {
         let signed_in = self.auth_token.is_some();
         let steam_ready = self.launcher_ready();
@@ -1156,22 +1196,20 @@ impl ArcTrackerSyncApp {
     fn launcher_toggle(&mut self, ui: &mut egui::Ui) {
         let current = self.effective_platform();
         let mut switch_to = None;
-        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            // right_to_left adds trailing-first, so place Epic then Steam to read
-            // "Steam | Epic" left-to-right.
-            if launcher_segment(
-                ui,
-                LauncherPlatform::Epic.label(),
-                current == LauncherPlatform::Epic,
-            ) {
-                switch_to = Some(LauncherPlatform::Epic);
-            }
+        ui.horizontal(|ui| {
             if launcher_segment(
                 ui,
                 LauncherPlatform::Steam.label(),
                 current == LauncherPlatform::Steam,
             ) {
                 switch_to = Some(LauncherPlatform::Steam);
+            }
+            if launcher_segment(
+                ui,
+                LauncherPlatform::Epic.label(),
+                current == LauncherPlatform::Epic,
+            ) {
+                switch_to = Some(LauncherPlatform::Epic);
             }
         });
         if let Some(platform) = switch_to.filter(|p| *p != current) {
@@ -1481,8 +1519,9 @@ impl ArcTrackerSyncApp {
                 } else if !self.token_submitted {
                     self.sync_enabled = response.sync_enabled;
                     // Authoritative server answer — no retry until a new token.
-                    self.last_sync_error =
-                        Some("ARCTracker answered success=false for the submitted token".to_string());
+                    self.last_sync_error = Some(
+                        "ARCTracker answered success=false for the submitted token".to_string(),
+                    );
                     self.submit_failed_at = None;
                     self.push_message(
                         "ARCTracker did not enable sync for this account".to_string(),
@@ -1836,8 +1875,10 @@ impl ArcTrackerSyncApp {
     }
 
     fn interface_label(interface: &InterfaceInfo) -> String {
+        // Show the friendly adapter name only; the raw interface name is a GUID
+        // (kept internally for selection) and is noise in the UI.
         match &interface.description {
-            Some(desc) if !desc.is_empty() => format!("{desc} ({})", interface.name),
+            Some(desc) if !desc.is_empty() => desc.clone(),
             _ => interface.name.clone(),
         }
     }
@@ -1888,17 +1929,161 @@ impl ArcTrackerSyncApp {
 
     // ----- rendering ---------------------------------------------------------------
 
-    fn render_hub(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let state = self.hub_state();
-        self.render_header(ui, ctx);
-        ui.add_space(theme::SPACE_LG);
-        self.render_progress_strip(ui, state);
-        ui.add_space(theme::SPACE_LG);
-        self.render_hero(ui, ctx, state);
-        ui.add_space(theme::SPACE_MD);
-        self.render_footer(ui);
-        self.render_explainer_modal(ctx);
-        self.render_update_modal(ctx);
+    /// The hub body: a persistent stepper rail on the left and the active phase's
+    fn render_hub_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: HubState) {
+        let tone = Self::state_accent(state);
+        let busy = Self::is_busy(state);
+        let inner = ui
+            .max_rect()
+            .shrink2(vec2(theme::BODY_PAD_X, theme::BODY_PAD_Y));
+
+        let rail_h = 4.0 * theme::STEP_ROW_HEIGHT;
+        let pad_top = ((inner.height() - rail_h) / 2.0).max(0.0);
+        let top = inner.top() + pad_top;
+
+        let rail_rect =
+            Rect::from_min_size(pos2(inner.left(), top), vec2(theme::RAIL_WIDTH, rail_h));
+        let divider_x = inner.left() + theme::RAIL_WIDTH + theme::COLUMN_GAP / 2.0;
+        let hero_left = inner.left() + theme::RAIL_WIDTH + theme::COLUMN_GAP;
+        // The hero spans the full body height (not the rail's centered band) so
+        // tall states (e.g. Synced) have room; its content is centered within.
+        let hero_rect = Rect::from_min_max(pos2(hero_left, inner.top()), inner.right_bottom());
+
+        // Full-height divider (matching the design), not just the rail's band.
+        ui.painter().vline(
+            divider_x,
+            (inner.top() + 6.0)..=(inner.bottom() - 6.0),
+            Stroke::new(1.0, arc_border_soft()),
+        );
+
+        // Left rail: the four-phase stepper. progress_stages() supplies each
+        let stages = self.progress_stages(state);
+        let labels = phase_node_labels(self.effective_platform().label());
+        let nodes = [
+            StepperNode {
+                number: 1,
+                label: &labels[0].0,
+                sub: &labels[0].1,
+                state: stages[0].1,
+            },
+            StepperNode {
+                number: 2,
+                label: &labels[1].0,
+                sub: &labels[1].1,
+                state: stages[1].1,
+            },
+            StepperNode {
+                number: 3,
+                label: &labels[2].0,
+                sub: &labels[2].1,
+                state: stages[2].1,
+            },
+            StepperNode {
+                number: 4,
+                label: &labels[3].0,
+                sub: &labels[3].1,
+                state: stages[3].1,
+            },
+        ];
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(rail_rect)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| vertical_stepper(ui, &nodes, tone, busy),
+        );
+
+        // Right panel: active phase detail + actions
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(hero_rect)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| self.hero_panel(ui, ctx, state),
+        );
+    }
+
+    fn hero_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: HubState) {
+        let (title, body) = self.hub_copy(state);
+        let tone = Self::state_accent(state);
+        let phase = Self::hub_phase(state);
+        let busy = Self::is_busy(state);
+        let phase_name = phase_node_labels(self.effective_platform().label())[phase]
+            .0
+            .clone();
+
+        // Center the content vertically within the hero column. egui can't
+        // measure ahead in immediate mode, so reuse last frame's height (stable
+        // per state; one frame settles after a state change).
+        let avail_h = ui.max_rect().height();
+        let offset = ((avail_h - self.hero_content_height) / 2.0).max(0.0);
+        ui.add_space(offset);
+        let used = ui
+            .scope(|ui| {
+                ui.horizontal(|ui| {
+                    // Icon tile and eyebrow share one centered row (gap 11px),
+                    // matching the design's [tile | "<PHASE> · STEP n OF 4"].
+                    ui.spacing_mut().item_spacing.x = 11.0;
+                    icon_tile(ui, phase, tone, busy);
+                    mono_eyebrow(
+                        ui,
+                        &format!(
+                            "{} · {}",
+                            phase_name,
+                            tr!("SyncApp.hero.step", n => (phase + 1).to_string())
+                        ),
+                        tone,
+                    );
+                });
+                ui.add_space(theme::SPACE_LG);
+                ui.label(
+                    RichText::new(title)
+                        .size(theme::TEXT_HUB_TITLE)
+                        .color(arc_foreground()),
+                );
+                ui.add_space(theme::SPACE_SM);
+                ui.label(
+                    RichText::new(body)
+                        .size(theme::TEXT_HERO_BODY)
+                        .color(arc_muted_text()),
+                );
+
+                if Self::is_launcher_phase(state) && self.launcher_switch_target().is_some() {
+                    ui.add_space(theme::SPACE_MD);
+                    self.launcher_toggle(ui);
+                }
+
+                if state == HubState::Synced {
+                    if let Some(until) = self.session_expiry_label() {
+                        ui.add_space(theme::SPACE_MD);
+                        tone_card(ui, arc_success(), |ui| {
+                            ui.horizontal(|ui| {
+                                inline_check(ui, arc_success());
+                                ui.add_space(theme::SPACE_SM);
+                                ui.label(
+                                    RichText::new(
+                                        tr!("SyncApp.state.synced.session", time => until),
+                                    )
+                                    .size(theme::TEXT_SECONDARY)
+                                    .strong()
+                                    .color(arc_foreground()),
+                                );
+                            });
+                        });
+                    }
+                    ui.add_space(theme::SPACE_SM);
+                    ui.label(
+                        RichText::new(tr!("SyncApp.state.synced.canClose"))
+                            .size(theme::TEXT_SECONDARY)
+                            .color(arc_muted_text()),
+                    );
+                }
+
+                ui.add_space(theme::SPACE_XL + 2.0);
+                self.render_hero_actions(ui, ctx, state);
+            })
+            .response
+            .rect
+            .height();
+        self.hero_content_height = used;
     }
 
     fn render_explainer_modal(&mut self, ctx: &egui::Context) {
@@ -1906,15 +2091,19 @@ impl ArcTrackerSyncApp {
             return;
         }
         let launcher = self.effective_platform().label();
-        let modal = egui::Modal::new(egui::Id::new("arc_explainer")).show(ctx, |ui| {
+        let modal = arc_modal("arc_explainer").show(ctx, |ui| {
             ui.set_max_width(theme::MODAL_WIDTH);
-            ui.label(
-                RichText::new(tr!("SyncApp.explain.title", launcher => launcher))
-                    .size(theme::TEXT_SUBTITLE)
-                    .strong()
-                    .color(arc_foreground()),
-            );
-            ui.add_space(theme::SPACE_MD);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = theme::SPACE_MD;
+                refresh_badge(ui);
+                ui.label(
+                    RichText::new(tr!("SyncApp.explain.title", launcher => launcher))
+                        .size(theme::TEXT_SUBTITLE)
+                        .strong()
+                        .color(arc_foreground()),
+                );
+            });
+            ui.add_space(theme::SPACE_LG);
             ui.label(
                 RichText::new(tr!("SyncApp.explain.body", launcher => launcher))
                     .size(theme::TEXT_SECONDARY)
@@ -1932,8 +2121,7 @@ impl ArcTrackerSyncApp {
         }
     }
 
-    /// Changelog + install dialog. Cannot be dismissed once an install is
-    /// under way.
+    /// Changelog + install dialog
     fn render_update_modal(&mut self, ctx: &egui::Context) {
         if !self.show_update_modal {
             return;
@@ -1943,7 +2131,7 @@ impl ArcTrackerSyncApp {
         let mut install_clicked = false;
         let mut close_clicked = false;
 
-        let modal = egui::Modal::new(egui::Id::new("arc_update")).show(ctx, |ui| {
+        let modal = arc_modal("arc_update").show(ctx, |ui| {
             ui.set_max_width(theme::MODAL_WIDTH);
             match &state {
                 UpdateState::Available | UpdateState::Failed(_) => {
@@ -2055,17 +2243,69 @@ impl ArcTrackerSyncApp {
             .clone()
     }
 
-    fn render_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// Optional update pill and the minimize / maximize / close
+    fn render_title_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rect: Rect,
+        maximized: bool,
+    ) {
         let mark = self.arc_mark(ctx);
         let signed_in = self.auth_token.is_some();
         let update_visible = self.update_indicator_visible();
+        let window_r = if maximized { 0 } else { theme::RADIUS_WINDOW };
+
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius {
+                nw: window_r,
+                ne: window_r,
+                sw: 0,
+                se: 0,
+            },
+            arc_titlebar(),
+        );
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            Stroke::new(1.0, arc_border_soft()),
+        );
+
+        let drag = ui.interact(
+            rect,
+            egui::Id::new("arc_titlebar_drag"),
+            Sense::click_and_drag(),
+        );
+        if drag.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if drag.double_clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
+
+        let inner = Rect::from_min_max(
+            pos2(rect.left() + 12.0, rect.top()),
+            pos2(rect.right() - 8.0, rect.bottom()),
+        );
         let mut open_update = false;
-        screen_header(
-            ui,
-            Some(&mark),
-            &tr!("SyncApp.appName"),
-            |_| {},
+        let mut minimize = false;
+        let mut toggle_max = false;
+        let mut close = false;
+
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(inner)
+                .layout(Layout::left_to_right(Align::Center)),
             |ui| {
+                ui.image((mark.id(), vec2(19.0, 19.0)));
+                ui.add_space(theme::SPACE_SM);
+                ui.label(
+                    RichText::new(tr!("SyncApp.appName"))
+                        .size(13.0)
+                        .color(arc_foreground()),
+                );
+                ui.add_space(theme::SPACE_SM);
                 pill(
                     ui,
                     &if signed_in {
@@ -2079,92 +2319,45 @@ impl ArcTrackerSyncApp {
                         arc_muted_text()
                     },
                 );
-                if update_visible {
-                    ui.add_space(theme::SPACE_SM);
-                    if clickable_pill(ui, &tr!("SyncApp.update.pill"), arc_primary()).clicked() {
-                        open_update = true;
-                    }
-                }
-            },
-        );
-        if open_update {
-            self.show_update_modal = true;
-        }
-    }
 
-    fn render_progress_strip(&mut self, ui: &mut egui::Ui, state: HubState) {
-        let stages = self.progress_stages(state);
-        Frame::NONE
-            .fill(arc_card())
-            .stroke(Stroke::new(1.0, arc_border()))
-            .corner_radius(CornerRadius::same(theme::RADIUS_CARD))
-            .inner_margin(Margin::symmetric(16, 12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let count = stages.len();
-                    for (index, (label, stage_state)) in stages.into_iter().enumerate() {
-                        progress_stage(ui, &label, stage_state);
-                        if index + 1 < count {
-                            ui.add_space(theme::SPACE_SM);
-                            ui.label(
-                                RichText::new("›")
-                                    .size(theme::TEXT_BODY)
-                                    .color(arc_muted_text()),
-                            );
-                            ui.add_space(theme::SPACE_SM);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if window_button(ui, WindowButton::Close) {
+                        close = true;
+                    }
+                    let max_kind = if maximized {
+                        WindowButton::Restore
+                    } else {
+                        WindowButton::Maximize
+                    };
+                    if window_button(ui, max_kind) {
+                        toggle_max = true;
+                    }
+                    if window_button(ui, WindowButton::Minimize) {
+                        minimize = true;
+                    }
+                    if update_visible {
+                        ui.add_space(theme::SPACE_SM);
+                        if clickable_pill(ui, &tr!("SyncApp.update.pill"), arc_primary()).clicked()
+                        {
+                            open_update = true;
                         }
                     }
                 });
-            });
-    }
+            },
+        );
 
-    fn render_hero(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: HubState) {
-        let (title, body) = self.hub_copy(state);
-        let accent = Self::state_accent(state);
-
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                status_dot(ui, accent);
-                ui.add_space(theme::SPACE_XS);
-                ui.label(
-                    RichText::new(title)
-                        .size(theme::TEXT_TITLE)
-                        .strong()
-                        .color(arc_foreground()),
-                );
-                if Self::is_launcher_phase(state) && self.launcher_switch_target().is_some() {
-                    self.launcher_toggle(ui);
-                }
-            });
-            ui.add_space(theme::SPACE_SM);
-            ui.label(
-                RichText::new(body)
-                    .size(theme::TEXT_BODY)
-                    .color(arc_muted_text()),
-            );
-
-            if state == HubState::Synced {
-                if let Some(until) = self.session_expiry_label() {
-                    ui.add_space(theme::SPACE_SM);
-                    ui.label(
-                        RichText::new(tr!("SyncApp.state.synced.session", time => until))
-                            .size(theme::TEXT_SECONDARY)
-                            .strong()
-                            .color(arc_foreground()),
-                    );
-                }
-                ui.add_space(theme::SPACE_SM);
-                ui.label(
-                    RichText::new(tr!("SyncApp.state.synced.canClose"))
-                        .size(theme::TEXT_SECONDARY)
-                        .color(arc_muted_text()),
-                );
-            }
-
-            ui.add_space(theme::SPACE_LG);
-            self.render_hero_actions(ui, ctx, state);
-        });
+        if open_update {
+            self.show_update_modal = true;
+        }
+        if minimize {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if toggle_max {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
+        if close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     fn render_hero_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: HubState) {
@@ -2210,7 +2403,10 @@ impl ArcTrackerSyncApp {
                 }
             }
             HubState::PreparingLauncher => {
-                ui.spinner();
+                spinner_row(
+                    ui,
+                    &tr!("SyncApp.state.preparingLauncher.waiting", launcher => self.effective_platform().label()),
+                );
             }
             HubState::CloseLauncher => {
                 if primary_button(
@@ -2225,8 +2421,11 @@ impl ArcTrackerSyncApp {
                     self.hide_to_tray(ctx);
                 }
             }
-            HubState::Connecting | HubState::Updating => {
-                ui.spinner();
+            HubState::Connecting => {
+                spinner_row(ui, &tr!("SyncApp.state.connecting.waiting"));
+            }
+            HubState::Updating => {
+                spinner_row(ui, &tr!("SyncApp.state.updating.waiting"));
             }
             HubState::Synced | HubState::SyncedIdle => {
                 if primary_button(ui, &tr!("SyncApp.action.viewStash")) {
@@ -2265,79 +2464,187 @@ impl ArcTrackerSyncApp {
         });
     }
 
-    fn render_footer(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let identity = match &self.account_name {
-                Some(account) if self.token_submitted => {
-                    tr!("SyncApp.footer.signedInAs", account => account)
-                }
-                _ if self.auth_token.is_some() => tr!("SyncApp.header.signedIn"),
-                _ => tr!("SyncApp.footer.notSignedIn"),
-            };
-            ui.label(
-                RichText::new(identity)
-                    .size(theme::TEXT_CAPTION)
-                    .color(arc_muted_text()),
-            );
+    /// The shared 52px footer: a status dot + identity line, with the settings gear
+    fn render_footer(&mut self, ui: &mut egui::Ui, rect: Rect, maximized: bool) {
+        let window_r = if maximized { 0 } else { theme::RADIUS_WINDOW };
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: window_r,
+                se: window_r,
+            },
+            arc_titlebar(),
+        );
+        ui.painter().hline(
+            rect.x_range(),
+            rect.top() + 0.5,
+            Stroke::new(1.0, arc_border_soft()),
+        );
 
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if link_button(ui, &tr!("SyncApp.footer.settings")) {
-                    self.screen = Screen::Settings;
-                }
-            });
-        });
+        let (dot_color, job) = self.footer_identity();
+        let inner = Rect::from_min_max(
+            pos2(rect.left() + theme::BODY_PAD_X, rect.top()),
+            pos2(rect.right() - 10.0, rect.bottom()),
+        );
+        let mut open_settings = false;
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(inner)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                // Draw the dot + identity as one unit, aligning the dot to the
+                // text's actual ink center.
+                let galley = ui.painter().layout_job(job);
+                let dot = 7.0;
+                let gap = theme::SPACE_SM;
+                let (id_rect, _) = ui.allocate_exact_size(
+                    vec2(dot + gap + galley.size().x, galley.size().y.max(dot)),
+                    Sense::hover(),
+                );
+                let text_top = id_rect.center().y - galley.size().y / 2.0;
+                let ink_center_y = text_top + galley.mesh_bounds.center().y;
+                ui.painter().circle_filled(
+                    pos2(id_rect.left() + dot / 2.0, ink_center_y),
+                    3.5,
+                    dot_color,
+                );
+                ui.painter().galley(
+                    pos2(id_rect.left() + dot + gap, text_top),
+                    galley,
+                    arc_muted_text(),
+                );
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.screen == Screen::Hub
+                        && settings_button(ui, &tr!("SyncApp.footer.settings"))
+                    {
+                        open_settings = true;
+                    }
+                });
+            },
+        );
+        if open_settings {
+            self.screen = Screen::Settings;
+        }
     }
 
-    fn render_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let mark = self.arc_mark(ctx);
-        let mut back = false;
-        screen_header(
-            ui,
-            Some(&mark),
-            &tr!("SyncApp.settings.title"),
-            |ui| {
-                if link_button(ui, "←") {
-                    back = true;
-                }
-                ui.add_space(theme::SPACE_SM);
-            },
-            |_| {},
-        );
-        if back {
-            self.screen = Screen::Hub;
+    /// Footer status dot color + identity text (the account is emphasized). The
+    /// identity is a `LayoutJob` so the dot can be aligned to its ink center.
+    fn footer_identity(&self) -> (Color32, egui::text::LayoutJob) {
+        use egui::text::{LayoutJob, TextFormat};
+        let font = egui::FontId::proportional(theme::TEXT_FOOTER);
+        let mut job = LayoutJob::default();
+        if self.token_submitted {
+            if let Some(account) = self.account_name.as_deref() {
+                job.append(
+                    &tr!("SyncApp.footer.syncedLabel"),
+                    0.0,
+                    TextFormat {
+                        font_id: font.clone(),
+                        color: arc_muted_text(),
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &format!(" {account}"),
+                    0.0,
+                    TextFormat {
+                        font_id: font,
+                        color: arc_foreground(),
+                        ..Default::default()
+                    },
+                );
+                return (arc_success(), job);
+            }
         }
-        ui.add_space(theme::SPACE_LG);
+        let (color, text) = if self.auth_token.is_some() {
+            (arc_muted_text(), tr!("SyncApp.header.signedIn"))
+        } else {
+            (arc_fg_dim(), tr!("SyncApp.footer.notSignedIn"))
+        };
+        job.append(
+            &text,
+            0.0,
+            TextFormat {
+                font_id: font,
+                color,
+                ..Default::default()
+            },
+        );
+        (color, job)
+    }
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                self.render_settings_account(ui);
+    /// The settings body: width-capped, scrollable stack of grouped cards
+    fn render_settings_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The scroll area spans the full body width so its scrollbar hugs the
+        // window's right edge (matching the design); the cards are inset with a
+        // horizontal frame margin instead of by shrinking the scroll region.
+        let pad = theme::BODY_PAD_X;
+        let body = ui.max_rect();
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(body)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                // Fixed header: back button + "Settings" title (the back
+                // affordance lives here rather than in the title bar).
+                ui.add_space(theme::BODY_PAD_Y);
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    ui.spacing_mut().item_spacing.x = theme::SPACE_MD;
+                    if back_button(ui) {
+                        self.screen = Screen::Hub;
+                    }
+                    ui.label(
+                        RichText::new(tr!("SyncApp.settings.title"))
+                            .size(theme::TEXT_SUBTITLE)
+                            .strong()
+                            .color(arc_foreground()),
+                    );
+                });
                 ui.add_space(theme::SPACE_MD);
-                self.render_settings_game(ui);
-                ui.add_space(theme::SPACE_MD);
-                self.render_settings_startup(ui);
-                ui.add_space(theme::SPACE_MD);
-                self.render_settings_language(ui, ctx);
-                ui.add_space(theme::SPACE_MD);
-                self.render_settings_network(ui);
-                ui.add_space(theme::SPACE_MD);
-                self.render_settings_troubleshooting(ui, ctx);
-                ui.add_space(theme::SPACE_LG);
-                self.render_settings_footer(ui);
-                ui.add_space(theme::SPACE_LG);
-                if secondary_button(ui, &tr!("SyncApp.tray.quit")) {
-                    self.quit();
-                }
 
-                if self.show_activity_log {
-                    ui.add_space(theme::SPACE_MD);
-                    self.render_activity_log(ui);
-                }
-            });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .scroll_source(egui::containers::scroll_area::ScrollSource {
+                        drag: false,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| {
+                        Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(pad as i8, 0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                self.render_settings_account(ui);
+                                ui.add_space(theme::SPACE_MD);
+                                self.render_settings_game(ui);
+                                ui.add_space(theme::SPACE_MD);
+                                self.render_settings_startup(ui);
+                                ui.add_space(theme::SPACE_MD);
+                                self.render_settings_language(ui, ctx);
+                                ui.add_space(theme::SPACE_MD);
+                                self.render_settings_network(ui);
+                                ui.add_space(theme::SPACE_MD);
+                                self.render_settings_troubleshooting(ui, ctx);
+                                ui.add_space(theme::SPACE_LG);
+                                self.render_settings_footer(ui);
+                                ui.add_space(theme::SPACE_LG);
+                                if secondary_button_full(ui, &tr!("SyncApp.settings.quit")) {
+                                    self.quit();
+                                }
+                                // Breathing room below the last card so the
+                                // scroll doesn't end flush against the footer.
+                                ui.add_space(theme::SPACE_SM);
+                            });
+                    });
+            },
+        );
     }
 
     fn render_settings_account(&mut self, ui: &mut egui::Ui) {
-        settings_section(ui, &tr!("SyncApp.settings.account"), |ui| {
+        settings_card(ui, &tr!("SyncApp.settings.account"), |ui| {
             let account = self
                 .account_name
                 .clone()
@@ -2350,29 +2657,24 @@ impl ArcTrackerSyncApp {
                         tr!("SyncApp.footer.notSignedIn")
                     }
                 });
-            ui.label(RichText::new(account).color(arc_foreground()));
-            ui.label(
-                RichText::new(tr!("SyncApp.settings.staysSignedIn"))
-                    .size(theme::TEXT_CAPTION)
-                    .color(arc_muted_text()),
-            );
-            ui.add_space(theme::SPACE_SM);
-            if ui
-                .add_enabled(
-                    self.auth_token.is_some(),
-                    egui::Button::new(tr!("SyncApp.settings.signOut")),
-                )
-                .clicked()
-            {
-                self.sign_out();
-            }
+            settings_row(ui, &account, &tr!("SyncApp.settings.staysSignedIn"), |ui| {
+                if ui
+                    .add_enabled(
+                        self.auth_token.is_some(),
+                        egui::Button::new(tr!("SyncApp.settings.signOut")),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.sign_out();
+                }
+            });
         });
     }
 
     fn render_settings_game(&mut self, ui: &mut egui::Ui) {
-        settings_section(ui, &tr!("SyncApp.settings.gameLauncher"), |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(tr!("SyncApp.settings.launcher")).color(arc_foreground()));
+        settings_card(ui, &tr!("SyncApp.settings.gameLauncher"), |ui| {
+            settings_row(ui, &tr!("SyncApp.settings.launcher"), "", |ui| {
                 let mut platform = self.config.platform;
                 egui::ComboBox::from_id_salt("settings_platform_combo")
                     .selected_text(platform.label())
@@ -2381,29 +2683,24 @@ impl ArcTrackerSyncApp {
                         ui.selectable_value(&mut platform, LauncherPlatform::Steam, "Steam");
                         ui.selectable_value(&mut platform, LauncherPlatform::Epic, "Epic Games");
                         ui.selectable_value(&mut platform, LauncherPlatform::Direct, "Direct");
-                    });
+                    })
+                    .response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if platform != self.config.platform {
                     self.set_launcher(platform);
                 }
             });
-
-            ui.add_space(theme::SPACE_SM);
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(tr!("SyncApp.settings.arcLocation")).color(arc_foreground()),
-                    );
-                    let location = self
-                        .selected_game_path()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| tr!("SyncApp.settings.autoDetected"));
-                    ui.label(
-                        RichText::new(location)
-                            .size(theme::TEXT_CAPTION)
-                            .color(arc_muted_text()),
-                    );
-                });
-                if ui.button(tr!("SyncApp.settings.change")).clicked() {
+            hairline(ui);
+            let location = self
+                .selected_game_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| tr!("SyncApp.settings.autoDetected"));
+            settings_row(ui, &tr!("SyncApp.settings.arcLocation"), &location, |ui| {
+                if ui
+                    .button(tr!("SyncApp.settings.change"))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
                     self.browse_game_executable();
                 }
             });
@@ -2411,100 +2708,113 @@ impl ArcTrackerSyncApp {
     }
 
     fn render_settings_startup(&mut self, ui: &mut egui::Ui) {
-        settings_section(ui, &tr!("SyncApp.settings.startup"), |ui| {
+        settings_card(ui, &tr!("SyncApp.settings.startup"), |ui| {
             let mut keep_in_tray = self.config.keep_in_tray;
-            if toggle_row(
+            settings_row(
                 ui,
                 &tr!("SyncApp.settings.keepInTray"),
                 &tr!("SyncApp.settings.keepInTraySub"),
-                &mut keep_in_tray,
-            ) {
-                self.config.keep_in_tray = keep_in_tray;
-                self.save_config();
-            }
+                |ui| {
+                    if toggle_switch(ui, &mut keep_in_tray) {
+                        self.config.keep_in_tray = keep_in_tray;
+                        self.save_config();
+                    }
+                },
+            );
         });
     }
 
     fn render_settings_language(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        settings_section(ui, &tr!("SyncApp.settings.language"), |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(tr!("SyncApp.settings.displayLanguage")).color(arc_foreground()),
-                );
+        settings_card(ui, &tr!("SyncApp.settings.language"), |ui| {
+            settings_row(
+                ui,
+                &tr!("SyncApp.settings.displayLanguage"),
+                &tr!("SyncApp.settings.matchesWindows"),
+                |ui| {
+                    let current_label = match self.config.language.as_deref() {
+                        Some(code) => i18n::native_name(code).to_string(),
+                        None => tr!("SyncApp.settings.matchWindows"),
+                    };
+                    let mut chosen: Option<Option<String>> = None;
 
-                let current_label = match self.config.language.as_deref() {
-                    Some(code) => i18n::native_name(code).to_string(),
-                    None => tr!("SyncApp.settings.matchesWindows"),
-                };
-                let mut chosen: Option<Option<String>> = None;
-
-                egui::ComboBox::from_id_salt("settings_language_combo")
-                    .selected_text(current_label)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(
-                                self.config.language.is_none(),
-                                tr!("SyncApp.settings.matchesWindows"),
-                            )
-                            .clicked()
-                        {
-                            chosen = Some(None);
-                        }
-                        for locale in i18n::UI_LOCALES.iter().copied() {
-                            let selected = self.config.language.as_deref() == Some(locale);
+                    egui::ComboBox::from_id_salt("settings_language_combo")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(selected, i18n::native_name(locale))
+                                .selectable_label(
+                                    self.config.language.is_none(),
+                                    tr!("SyncApp.settings.matchWindows"),
+                                )
                                 .clicked()
                             {
-                                chosen = Some(Some(locale.to_string()));
+                                chosen = Some(None);
                             }
-                        }
-                    });
+                            for locale in i18n::UI_LOCALES.iter().copied() {
+                                let selected = self.config.language.as_deref() == Some(locale);
+                                if ui
+                                    .selectable_label(selected, i18n::native_name(locale))
+                                    .clicked()
+                                {
+                                    chosen = Some(Some(locale.to_string()));
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
 
-                if let Some(language) = chosen {
-                    self.change_language(ctx, language);
-                }
-            });
+                    if let Some(language) = chosen {
+                        self.change_language(ctx, language);
+                    }
+                },
+            );
         });
     }
 
     fn render_settings_network(&mut self, ui: &mut egui::Ui) {
-        settings_section(ui, &tr!("SyncApp.settings.network"), |ui| {
-            // Stacked layout: adapter labels can be long (GUIDs) and the row
-            // would otherwise push the card past the window edge.
-            ui.label(RichText::new(tr!("SyncApp.settings.networkAdapter")).color(arc_foreground()));
-            ui.label(
-                RichText::new(tr!("SyncApp.settings.networkAdapterSub"))
-                    .size(theme::TEXT_CAPTION)
-                    .color(arc_muted_text()),
-            );
-            ui.add_space(theme::SPACE_SM);
-
+        settings_card(ui, &tr!("SyncApp.settings.network"), |ui| {
             let selected_label = self
                 .selected_interface()
                 .map(Self::interface_label)
-                .unwrap_or_else(|| "Auto".to_string());
+                .unwrap_or_else(|| "Automatic".to_string());
             let mut selected_name = None;
             let mut refresh = false;
 
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                refresh = ui.button(tr!("SyncApp.settings.refresh")).clicked();
-                egui::ComboBox::from_id_salt("settings_interface_combo")
-                    .selected_text(selected_label)
-                    .width(theme::COMBO_WIDE.min(ui.available_width()))
-                    .truncate()
-                    .show_ui(ui, |ui| {
-                        for (index, interface) in self.interfaces.iter().enumerate() {
-                            let label = Self::interface_label(interface);
-                            if ui
-                                .selectable_value(&mut self.selected_interface_index, index, label)
-                                .changed()
-                            {
-                                selected_name = Some(interface.name.clone());
+            settings_row(
+                ui,
+                &tr!("SyncApp.settings.networkAdapter"),
+                &tr!("SyncApp.settings.networkAdapterSub"),
+                |ui| {
+                    // Force the dropdown and Refresh button to a common height so
+                    // they sit on the same baseline (egui won't reflow the first
+                    // widget once the taller one is added).
+                    ui.spacing_mut().interact_size.y = 30.0;
+                    refresh = ui
+                        .button(tr!("SyncApp.settings.refresh"))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked();
+                    egui::ComboBox::from_id_salt("settings_interface_combo")
+                        .selected_text(selected_label)
+                        .width(theme::COMBO_ADAPTER)
+                        .truncate()
+                        .show_ui(ui, |ui| {
+                            for (index, interface) in self.interfaces.iter().enumerate() {
+                                let label = Self::interface_label(interface);
+                                if ui
+                                    .selectable_value(
+                                        &mut self.selected_interface_index,
+                                        index,
+                                        label,
+                                    )
+                                    .changed()
+                                {
+                                    selected_name = Some(interface.name.clone());
+                                }
                             }
-                        }
-                    });
-            });
+                        })
+                        .response
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                },
+            );
 
             if let Some(name) = selected_name {
                 self.config.selected_interface = Some(name);
@@ -2520,40 +2830,45 @@ impl ArcTrackerSyncApp {
     }
 
     fn render_settings_troubleshooting(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        settings_section(ui, &tr!("SyncApp.settings.troubleshooting"), |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(tr!("SyncApp.settings.activityLog")).color(arc_foreground()),
-                    );
-                    ui.label(
-                        RichText::new(tr!("SyncApp.settings.activityLogSub"))
-                            .size(theme::TEXT_CAPTION)
-                            .color(arc_muted_text()),
-                    );
-                });
-                if ui.button(tr!("SyncApp.settings.view")).clicked() {
-                    self.show_activity_log = !self.show_activity_log;
-                }
-            });
-
-            ui.add_space(theme::SPACE_SM);
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(tr!("SyncApp.settings.copyDiagnostics"))
-                            .color(arc_foreground()),
-                    );
-                    ui.label(
-                        RichText::new(tr!("SyncApp.settings.copyDiagnosticsSub"))
-                            .size(theme::TEXT_CAPTION)
-                            .color(arc_muted_text()),
-                    );
-                });
-                if ui.button(tr!("SyncApp.settings.copy")).clicked() {
-                    self.copy_diagnostics(ctx);
-                }
-            });
+        settings_card(ui, &tr!("SyncApp.settings.troubleshooting"), |ui| {
+            let view_label = if self.show_activity_log {
+                tr!("SyncApp.settings.hide")
+            } else {
+                tr!("SyncApp.settings.view")
+            };
+            settings_row(
+                ui,
+                &tr!("SyncApp.settings.activityLog"),
+                &tr!("SyncApp.settings.activityLogSub"),
+                |ui| {
+                    if ui
+                        .button(view_label)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.show_activity_log = !self.show_activity_log;
+                    }
+                },
+            );
+            hairline(ui);
+            settings_row(
+                ui,
+                &tr!("SyncApp.settings.copyDiagnostics"),
+                &tr!("SyncApp.settings.copyDiagnosticsSub"),
+                |ui| {
+                    if ui
+                        .button(tr!("SyncApp.settings.copy"))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.copy_diagnostics(ctx);
+                    }
+                },
+            );
+            if self.show_activity_log {
+                ui.add_space(theme::SPACE_MD);
+                self.render_activity_log(ui);
+            }
         });
     }
 
@@ -2563,37 +2878,47 @@ impl ArcTrackerSyncApp {
                 RichText::new(
                     tr!("SyncApp.settings.version", version => env!("CARGO_PKG_VERSION")),
                 )
-                .size(theme::TEXT_CAPTION)
-                .color(arc_muted_text()),
+                .font(egui::FontId::monospace(theme::TEXT_PILL))
+                .color(arc_fg_dim()),
             );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if link_button(ui, &tr!("SyncApp.settings.checkForUpdates")) {
-                    let _ = auth_bridge::open_browser(BASE_URL);
+                if link_button(ui, &tr!("SyncApp.settings.whatIsSync")) {
+                    self.show_explainer = true;
                 }
             });
         });
     }
 
-    fn render_activity_log(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
-            ui.label(
-                RichText::new(tr!("SyncApp.settings.activityLog"))
-                    .strong()
-                    .color(arc_foreground()),
-            );
-            ui.add_space(theme::SPACE_SM);
-            if self.messages.is_empty() {
-                ui.label(RichText::new("—").color(arc_muted_text()));
-            } else {
-                for message in &self.messages {
-                    ui.label(
-                        RichText::new(Self::support_event_message(message))
-                            .size(theme::TEXT_CAPTION)
-                            .color(arc_muted_text()),
-                    );
+    /// The activity log, rendered as an inset panel inside the Troubleshooting
+    /// card (each event prefixed with a muted "›", monospace).
+    fn render_activity_log(&self, ui: &mut egui::Ui) {
+        Frame::NONE
+            .fill(arc_input())
+            .stroke(Stroke::new(1.0, arc_border()))
+            .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if self.messages.is_empty() {
+                    ui.label(RichText::new("—").color(arc_muted_text()));
+                } else {
+                    for message in &self.messages {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = theme::SPACE_SM;
+                            ui.label(
+                                RichText::new("›")
+                                    .font(egui::FontId::monospace(theme::TEXT_SUBLABEL))
+                                    .color(arc_border_strong()),
+                            );
+                            ui.label(
+                                RichText::new(Self::support_event_message(message))
+                                    .font(egui::FontId::monospace(theme::TEXT_SUBLABEL))
+                                    .color(arc_fg_dim()),
+                            );
+                        });
+                    }
                 }
-            }
-        });
+            });
     }
 }
 
@@ -2621,35 +2946,59 @@ impl ArcTrackerSyncApp {
 
         ctx.request_repaint_after(Duration::from_millis(750));
 
-        egui::CentralPanel::default()
-            .frame(Frame::NONE.fill(arc_bg()).inner_margin(Margin::same(24)))
-            .show(ctx, |ui| {
-                // The column wraps the scroll areas (not the other way around)
-                // so it always works with the panel's finite rect.
-                Self::content_column(ui, |ui| match self.screen {
-                    Screen::Hub => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.render_hub(ui, ctx));
-                    }
-                    Screen::Settings => self.render_settings(ui, ctx),
-                });
-            });
-    }
+        let maximized = ctx
+            .input(|input| input.viewport().maximized)
+            .unwrap_or(false);
+        let window_r = if maximized { 0 } else { theme::RADIUS_WINDOW };
+        let window_frame = Frame::NONE
+            .fill(arc_bg())
+            .stroke(Stroke::new(1.0, arc_border()))
+            .corner_radius(CornerRadius::same(window_r));
 
-    /// Center a column capped at [`theme::CONTENT_MAX_WIDTH`] so wide or
-    /// maximized windows don't stretch the cards edge-to-edge. Renders into a
-    /// child rect directly (not a horizontal/vertical nest, which would starve
-    /// nested scroll areas of height).
-    fn content_column(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-        let available = ui.available_rect_before_wrap();
-        let column = available.width().min(theme::CONTENT_MAX_WIDTH);
-        let x = available.left() + ((available.width() - column) / 2.0).max(0.0);
-        let rect = egui::Rect::from_x_y_ranges(x..=x + column, available.y_range());
-        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-            ui.set_width(column);
-            add_contents(ui);
-        });
+        let state = self.hub_state();
+
+        egui::CentralPanel::default()
+            .frame(window_frame)
+            .show(ctx, |ui| {
+                let app_rect = ui.max_rect();
+                let title_rect = Rect::from_min_size(
+                    app_rect.min,
+                    vec2(app_rect.width(), theme::TITLE_BAR_HEIGHT),
+                );
+                let footer_rect = Rect::from_min_max(
+                    pos2(app_rect.left(), app_rect.bottom() - theme::FOOTER_HEIGHT),
+                    app_rect.max,
+                );
+                let body_rect = Rect::from_min_max(
+                    pos2(app_rect.left(), app_rect.top() + theme::TITLE_BAR_HEIGHT),
+                    pos2(app_rect.right(), app_rect.bottom() - theme::FOOTER_HEIGHT),
+                );
+
+                // Soft gold glow at the top of the body, clipped so it can't
+                // bleed over the title bar or the window's rounded corners.
+                top_glow(&ui.painter().with_clip_rect(body_rect), body_rect);
+
+                self.render_title_bar(ui, ctx, title_rect, maximized);
+                self.render_footer(ui, footer_rect, maximized);
+
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(body_rect)
+                        .layout(Layout::top_down(Align::Min)),
+                    |ui| match self.screen {
+                        Screen::Hub => self.render_hub_body(ui, ctx, state),
+                        Screen::Settings => self.render_settings_body(ui, ctx),
+                    },
+                );
+
+                // Edge/corner resize grips on top (a fixed window has none)
+                if !maximized {
+                    resize_handles(ctx, ui, app_rect);
+                }
+            });
+
+        self.render_explainer_modal(ctx);
+        self.render_update_modal(ctx);
     }
 }
 
@@ -2659,9 +3008,35 @@ impl eframe::App for SharedArcTrackerSyncApp {
             app.update_frame(ctx, frame);
         }
     }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
 }
 
 // ----- app-local helpers ------------------------------------------------------
+
+/// The four stepper phases
+fn phase_node_labels(launcher: &str) -> [(String, String); 4] {
+    [
+        (
+            tr!("SyncApp.phase.account.label"),
+            tr!("SyncApp.phase.account.sub"),
+        ),
+        (
+            tr!("SyncApp.phase.launcher.label"),
+            tr!("SyncApp.phase.launcher.sub", launcher => launcher),
+        ),
+        (
+            tr!("SyncApp.phase.play.label"),
+            tr!("SyncApp.phase.play.sub"),
+        ),
+        (
+            tr!("SyncApp.phase.sync.label"),
+            tr!("SyncApp.phase.sync.sub"),
+        ),
+    ]
+}
 
 /// Activity-log notice for a user-set SSLKEYLOGFILE that was ignored. Uses the
 /// app's "sync key" product term so it reads cleanly in the activity log and

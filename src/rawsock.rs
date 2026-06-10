@@ -33,10 +33,10 @@ mod imp {
     const SOL_SOCKET: i32 = 0xffff;
     const SO_RCVBUF: i32 = 0x1002;
     const SIO_RCVALL: u32 = 0x9800_0001; // _WSAIOW(IOC_VENDOR, 1)
-    // RCVALL_IPLEVEL: all packets to/from this interface's IP, both directions,
-    // without promiscuous mode. RCVALL_ON (1, full promiscuous) is unreliable
-    // for the host's own inbound traffic, notably on Wi-Fi — it drops the
-    // ServerHello and breaks TLS key establishment.
+                                         // RCVALL_IPLEVEL: all packets to/from this interface's IP, both directions,
+                                         // without promiscuous mode. RCVALL_ON (1, full promiscuous) is unreliable
+                                         // for the host's own inbound traffic, notably on Wi-Fi — it drops the
+                                         // ServerHello and breaks TLS key establishment.
     const RCVALL_IPLEVEL: u32 = 3;
     const FIONBIO: i32 = 0x8004_667e_u32 as i32;
     const INVALID_SOCKET: usize = usize::MAX;

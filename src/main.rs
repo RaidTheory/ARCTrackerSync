@@ -31,6 +31,9 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([760.0, 500.0])
             .with_min_inner_size([700.0, 460.0])
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(true)
             .with_icon(app_icon())
             .with_title(i18n::__translate("SyncApp.appName", &[])),
         ..Default::default()
