@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: clippy + build + tests
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --locked
+
+      # The requireAdministrator manifest (see build.rs) is baked into the
+      # unit-test harness too, so the test binary can't launch without UAC
+      # elevation the runner can't grant. Compile-only here; run the tests
+      # locally from an elevated shell.
+      - name: Compile tests
+        run: cargo test --no-run --locked

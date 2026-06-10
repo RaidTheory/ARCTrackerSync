@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label for the artifact (e.g. 0.1.0). Defaults to the Cargo.toml version.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      # Must run before staging/zipping: the self-updater verifies the zip's
+      # SHA256, so the exe has to carry its signature before it is hashed.
+      - name: Sign executable (Azure Artifact Signing)
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://wus2.codesigning.azure.net
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.SIGNING_CERT_PROFILE_NAME }}
+          files: ${{ github.workspace }}\target\release\arctracker-sync.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF -replace '^refs/tags/v', ''
+          } elseif ('${{ github.event.inputs.version }}' -ne '') {
+            $version = '${{ github.event.inputs.version }}'
+          } else {
+            $version = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Resolved version: $version"
+
+      - name: Stage and zip release files
+        id: stage
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $name = "arctracker-sync-$version-windows-x64"
+          $dist = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item 'target/release/arctracker-sync.exe' $dist
+          Copy-Item 'README.md' $dist
+          Copy-Item 'LICENSE' $dist
+          Copy-Item 'THIRD-PARTY-NOTICES.md' $dist
+          $zip = "$name.zip"
+          Compress-Archive -Path "$dist/*" -DestinationPath $zip -Force
+          # The self-updater requires an asset named exactly SHA256SUMS
+          # (hash + two spaces + asset name, sha256sum style) and refuses a
+          # release without it. Keep in lockstep with src/updater.rs
+          # (SUMS_ASSET / find_expected_hash).
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -FilePath 'SHA256SUMS' -Encoding ascii
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Created $zip"
+          Write-Host "SHA256: $hash"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: arctracker-sync-${{ steps.version.outputs.version }}-windows-x64
+          path: |
+            ${{ steps.stage.outputs.zip }}
+            SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ${{ steps.stage.outputs.zip }}
+            SHA256SUMS
+          body: |
+            ## ARCTracker Sync ${{ steps.version.outputs.version }}
+
+            Windows desktop build (x64).
+
+            ### Requirements
+            - The app requests **Administrator** elevation (required for local packet capture). The executable is digitally signed; SmartScreen may still warn briefly while the release builds reputation.
+
+            ### Contents
+            - `arctracker-sync.exe`
+            - `README.md`, `LICENSE`, `THIRD-PARTY-NOTICES.md`
+            - `SHA256SUMS` — checksum of the zip; the app's self-updater verifies downloads against it
+
+            Licensed under the PolyForm Noncommercial License 1.0.0 — free for
+            noncommercial use. Commercial use requires a separate license; contact
+            matt@arctracker.io.

@@ -1,0 +1,26 @@
+# Build output
+/target/
+
+# Local release staging (mirrors .github/workflows/release.yml run locally)
+/dist/
+*.zip
+SHA256SUMS
+
+# Local Azure Artifact Signing config (copy scripts/sign-metadata.example.json)
+/scripts/sign-metadata.json
+
+# Local maintainer notes / todo (never committed)
+/.local/
+
+# Generated dependency license reports (see THIRD-PARTY-NOTICES.md)
+/about.hbs
+/THIRD-PARTY-FULL.html
+
+# Packet captures from local debugging
+*.pcap
+*.pcapng
+
+# Editor / tool state
+/.vscode/
+/.idea/
+/.claude/settings.local.json

@@ -1,0 +1,63 @@
+[package]
+name = "arctracker-sync"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Windows desktop helper that syncs your ARC Raiders inventory to ARCTracker."
+authors = ["RaidTheory LLC"]
+repository = "https://github.com/RaidTheory/ARCTrackerSync"
+homepage = "https://arctracker.io"
+# PolyForm Noncommercial 1.0.0 has no SPDX identifier, so `license` can't be used.
+license-file = "LICENSE"
+
+[[bin]]
+name = "arctracker-sync"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+compact_str = "0.8"
+crossbeam-channel = "0.5"
+directories = "6"
+eframe = "0.33"
+etherparse = "0.15"
+getrandom = "0.2"
+hex = "0.4"
+pcapsql-core = { path = "vendor/pcapsql-core", default-features = false }
+rfd = "0.15"
+rust-i18n = "3"
+self-replace = "1.5"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+ureq = { version = "2", features = ["json", "tls"] }
+# DEFLATE-only: GitHub-produced release zips use DEFLATE; skip bzip2/zstd/aes to stay lean.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+tray-icon = "0.19"
+
+[dev-dependencies]
+# tests/release_pipeline.rs authors release zips and checksums for its in-process
+# server. The integration-test target gets no manifest — see lib.rs.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+hex = "0.4"
+semver = "1"
+
+[build-dependencies]
+# Bakes the icon assets at build time so the runtime needs no image decoder.
+# png + ico only: ICO frames are PNG-compressed, so ico reuses the png codec.
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-manifest = "1"
+# Embeds the baked .ico as the PE icon resource; embed-manifest can't do icons.
+embed-resource = "3"

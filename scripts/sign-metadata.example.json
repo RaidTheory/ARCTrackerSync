@@ -1,0 +1,15 @@
+{
+  "Endpoint": "https://wus2.codesigning.azure.net",
+  "CodeSigningAccountName": "<your signing account name>",
+  "CertificateProfileName": "<your certificate profile name>",
+  "ExcludeCredentials": [
+    "ManagedIdentityCredential",
+    "WorkloadIdentityCredential",
+    "SharedTokenCacheCredential",
+    "VisualStudioCredential",
+    "VisualStudioCodeCredential",
+    "AzurePowerShellCredential",
+    "AzureDeveloperCliCredential",
+    "InteractiveBrowserCredential"
+  ]
+}

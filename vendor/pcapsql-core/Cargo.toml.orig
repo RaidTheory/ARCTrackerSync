@@ -1,0 +1,91 @@
+[package]
+name = "pcapsql-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Engine-agnostic PCAP protocol parsing library"
+readme = "README.md"
+keywords = ["pcap", "network", "protocol", "parser"]
+categories = ["network-programming", "parsing"]
+
+[features]
+default = ["mmap", "compress-gzip", "compress-zstd"]
+
+# Memory-mapped I/O for efficient large file reading
+mmap = ["dep:memmap2"]
+
+# Compression formats
+compress-gzip = []  # flate2 is always included (used by pcap reader)
+compress-zstd = ["dep:zstd"]
+compress-lz4 = ["dep:lz4_flex"]
+compress-bzip2 = ["dep:bzip2"]
+compress-xz = ["dep:xz2"]
+compress-all = ["compress-gzip", "compress-zstd", "compress-lz4", "compress-bzip2", "compress-xz"]
+
+# Cloud storage support
+cloud = ["dep:object_store", "dep:url", "dep:tokio"]
+s3 = ["cloud", "object_store/aws"]
+gcs = ["cloud", "object_store/gcp"]
+azure = ["cloud", "object_store/azure"]
+cloud-all = ["s3", "gcs", "azure"]
+
+[dependencies]
+# Parsing
+etherparse.workspace = true
+pcap-parser.workspace = true
+bytes.workspace = true
+httparse.workspace = true
+simple-dns.workspace = true
+
+# Compression (flate2 always included for gzip, others optional)
+flate2.workspace = true
+zstd = { workspace = true, optional = true }
+lz4_flex = { workspace = true, optional = true }
+bzip2 = { workspace = true, optional = true }
+xz2 = { workspace = true, optional = true }
+
+# Memory-mapped I/O (optional)
+memmap2 = { workspace = true, optional = true }
+
+# Cloud storage (optional)
+object_store = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Small collections
+smallvec.workspace = true
+
+# Compact strings (inline up to 24 bytes)
+compact_str.workspace = true
+
+# TLS parsing (Rusticata project - zero-copy passive TLS parser)
+tls-parser.workspace = true
+nom.workspace = true
+
+# Hash functions for JA3 fingerprinting
+md5.workspace = true
+
+# Cryptographic primitives for TLS decryption
+ring.workspace = true
+
+# HTTP/2 HPACK header compression (RFC 7541)
+hpack.workspace = true
+
+# Netlink protocol parsing
+netlink-packet-core.workspace = true
+netlink-packet-route.workspace = true
+netlink-packet-utils.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hex.workspace = true
