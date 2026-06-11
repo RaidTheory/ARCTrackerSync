@@ -1,98 +1,145 @@
-# Releasing & code signing (maintainers)
+# Releasing and code signing
 
-Official releases are code-signed with **Azure Artifact Signing** (formerly
-Trusted Signing). Signing is done internally by maintainers with access to the
-Azure signing account — **contributors never need any of this** to build, test,
-or submit changes.
+Official Windows releases are code-signed with **Azure Artifact Signing**.
+Signing is maintainer-only; contributors do not need Azure access to build,
+test, or submit changes.
 
-## How releases work
+## What the release workflow does
 
-Push a tag matching `v*.*.*` (or run the Release workflow manually). The
-workflow in `.github/workflows/release.yml`:
+Push a tag matching `v*.*.*` or run the Release workflow manually. The workflow
+in `.github/workflows/release.yml`:
 
-1. Builds `arctracker-sync.exe` with `cargo build --release --locked`
-2. Signs the exe via `azure/artifact-signing-action@v2`
-3. Stages and zips the release, then writes `SHA256SUMS`
+1. Builds `arctracker-sync.exe` with `cargo build --release --locked`.
+2. Authenticates to Azure with GitHub OIDC through the `release` environment.
+3. Signs the exe with `azure/artifact-signing-action@v2`.
+4. Stages and zips the release, then writes `SHA256SUMS`.
 
-Signing happens **before** zipping/hashing because the in-app self-updater
-verifies the zip against `SHA256SUMS` — the hash must cover the signed exe.
+Signing must happen before zipping and hashing. The in-app updater verifies the
+zip against `SHA256SUMS`, so the hash must cover the already-signed exe.
 
-## CI configuration (GitHub repo settings)
+## Values needed from Azure
 
-Secrets (Settings → Secrets and variables → Actions → Secrets):
+From the Artifact Signing account / certificate profile:
+
+| Value | Where it goes |
+|---|---|
+| Artifact Signing endpoint, for example `https://wus2.codesigning.azure.net` | GitHub variable `SIGNING_ENDPOINT`; local `scripts/sign-metadata.json` |
+| Artifact Signing account name | GitHub variable `SIGNING_ACCOUNT_NAME`; local `scripts/sign-metadata.json` |
+| Certificate profile name | GitHub variable `SIGNING_CERT_PROFILE_NAME`; local `scripts/sign-metadata.json` |
+| Entra tenant ID | GitHub secret `AZURE_TENANT_ID` |
+| Azure subscription ID | GitHub secret `AZURE_SUBSCRIPTION_ID` |
+| App registration / service principal client ID | GitHub secret `AZURE_CLIENT_ID` |
+
+No PFX, private key, or GitHub-stored client secret is required.
+
+## GitHub Actions setup
+
+Create a GitHub environment named `release`.
+
+In repository settings, add these Actions secrets:
 
 | Secret | Value |
 |---|---|
 | `AZURE_TENANT_ID` | Entra tenant ID |
-| `AZURE_CLIENT_ID` | App registration (service principal) client ID |
-| `AZURE_CLIENT_SECRET` | Client secret for that app registration |
+| `AZURE_SUBSCRIPTION_ID` | Azure subscription ID containing the signing account |
+| `AZURE_CLIENT_ID` | App registration / service principal client ID |
 
-Variables (same page → Variables):
+Add these Actions variables:
 
 | Variable | Value |
 |---|---|
+| `SIGNING_ENDPOINT` | Region endpoint for the Artifact Signing account |
 | `SIGNING_ACCOUNT_NAME` | Artifact Signing account name |
 | `SIGNING_CERT_PROFILE_NAME` | Certificate profile name |
 
-Azure side: the service principal needs the **"Artifact Signing Certificate
-Profile Signer"** role on the signing account (Access control / IAM), and the
-account's identity validation must show **Completed** — signing returns 403
-otherwise. The endpoint in the workflow (`https://wus2.codesigning.azure.net`)
-must match the account's region (West US 2).
+In Azure, configure the app registration / service principal:
+
+1. Add a federated credential for this repository's GitHub `release`
+   environment. The subject is:
+
+   ```text
+   repo:RaidTheory/ARCTrackerSync:environment:release
+   ```
+
+2. Assign the service principal the **Artifact Signing Certificate Profile
+   Signer** role on the signing account or certificate profile.
+3. Confirm the Artifact Signing identity validation shows **Completed**.
+
+The endpoint must match the Azure region where the Artifact Signing account and
+certificate profile were created. A region mismatch commonly fails with 403.
+
+Common US endpoints:
+
+| Region | Endpoint |
+|---|---|
+| East US | `https://eus.codesigning.azure.net` |
+| Central US | `https://cus.codesigning.azure.net` |
+| West US | `https://wus.codesigning.azure.net` |
+| West US 2 | `https://wus2.codesigning.azure.net` |
+| West US 3 | `https://wus3.codesigning.azure.net` |
 
 ## Signing locally
 
 One-time setup:
 
-1. Install the client tools (signtool, the Azure dlib, .NET 8 runtime,
-   VC++ redistributable):
+1. Install the client tools:
 
    ```powershell
    winget install -e --id Microsoft.Azure.ArtifactSigningClientTools
    ```
 
-2. Make sure your own Azure account has the **"Artifact Signing Certificate
-   Profile Signer"** role on the signing account, then sign in:
+   This installs SignTool, the Artifact Signing dlib, .NET 8 runtime, and the
+   VC++ redistributable needed by SignTool.
+
+2. Make sure your Azure user has the **Artifact Signing Certificate Profile
+   Signer** role on the signing account or certificate profile.
+
+3. Sign in locally:
 
    ```powershell
    az login
    ```
 
-3. Copy `scripts/sign-metadata.example.json` to `scripts/sign-metadata.json`
-   (gitignored) and fill in the account and certificate profile names from the
-   signing account's Overview page in the Azure portal.
+4. Copy `scripts/sign-metadata.example.json` to
+   `scripts/sign-metadata.json`. The local metadata file is gitignored. Fill in:
 
-Then, after a release build:
+   ```json
+   {
+     "Endpoint": "https://<region>.codesigning.azure.net",
+     "CodeSigningAccountName": "<account name>",
+     "CertificateProfileName": "<certificate profile name>"
+   }
+   ```
+
+After a release build:
 
 ```powershell
 cargo build --release --locked
-pwsh scripts/sign.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\sign.ps1
 ```
 
-The script signs `target\release\arctracker-sync.exe`, timestamps it, and
-verifies the result. Check manually with:
+The script signs `target\release\arctracker-sync.exe`, timestamps it, and runs
+`signtool verify`.
+
+You can also inspect the signature with:
 
 ```powershell
 Get-AuthenticodeSignature target\release\arctracker-sync.exe
 ```
 
-Status should be `Valid` with a chain under "Microsoft ID Verified Code
-Signing PCA 2021".
+Expected status: `Valid`.
 
 ## Troubleshooting
 
-- **Timestamping is not optional.** Artifact Signing certificates are valid
-  for ~3 days and rotate automatically; only the RFC 3161 timestamp
-  (`http://timestamp.acs.microsoft.com`) keeps signatures valid afterward.
-  Both the script and the workflow always timestamp.
-- **signtool "succeeds" but the file is unsigned** — the x64 .NET 8 runtime is
-  missing (signtool fails silently without it). The winget package installs it.
-- **"No certificates were found that met all the given criteria"** — signtool
-  is too old (needs Windows SDK ≥ 10.0.2261x) or the dlib path is wrong.
-- **403 from the service** — check the signer role assignment, the
-  endpoint-region match, the exact account/profile names, and the account's
-  identity validation status.
-- **SmartScreen still warns** — reputation accrues per release; signing removes
-  "Unknown publisher" but brand-new binaries can prompt until download history
-  builds. Persistent warnings: submit the signed file to Microsoft Security
-  Intelligence.
+- **Timestamping is not optional.** Artifact Signing certificates are short
+  lived. The RFC 3161 timestamp keeps signatures valid after certificate
+  rotation.
+- **403 from the service** usually means the signer role is missing, the
+  endpoint does not match the account region, the account/profile names are
+  wrong, or identity validation is not completed.
+- **No certificates were found that met all the given criteria** usually means
+  SignTool is too old or the dlib path is wrong.
+- **The file is still unsigned after SignTool runs** usually means the matching
+  x64 .NET 8 runtime is missing.
+- **SmartScreen still warns** can happen while reputation builds. Signing
+  removes "Unknown publisher", but very new binaries can still prompt.

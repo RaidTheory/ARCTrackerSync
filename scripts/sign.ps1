@@ -15,9 +15,9 @@
     Files to sign. Defaults to target\release\arctracker-sync.exe.
 
 .EXAMPLE
-    pwsh scripts/sign.ps1
+    powershell -ExecutionPolicy Bypass -File .\scripts\sign.ps1
 .EXAMPLE
-    pwsh scripts/sign.ps1 -Files target\release\arctracker-sync.exe
+    powershell -ExecutionPolicy Bypass -File .\scripts\sign.ps1 -Files target\release\arctracker-sync.exe
 #>
 [CmdletBinding()]
 param(
@@ -71,6 +71,7 @@ $clientToolsRoots = @(
     "$env:ProgramFiles\Microsoft*Artifact*Signing*",
     "$env:ProgramFiles\Microsoft*Trusted*Signing*",
     "${env:ProgramFiles(x86)}\Microsoft*Artifact*Signing*",
+    "$env:LOCALAPPDATA\Microsoft\MicrosoftArtifactSigningClientTools",
     "$env:LOCALAPPDATA\Microsoft*Artifact*Signing*"
 )
 
@@ -90,6 +91,7 @@ if (-not $signtool -or -not (Test-Path $signtool)) {
 $dlib = $env:AZURE_SIGN_DLIB
 if (-not $dlib) {
     $dlib = Find-Tool -FileName 'Azure.CodeSigning.Dlib.dll' -WildcardPatterns @(
+        "$env:LOCALAPPDATA\Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll",
         "$env:USERPROFILE\.nuget\packages\microsoft.artifactsigning.client\*\bin\x64\Azure.CodeSigning.Dlib.dll",
         "$env:USERPROFILE\.nuget\packages\microsoft.trusted.signing.client\*\bin\x64\Azure.CodeSigning.Dlib.dll"
     ) -SearchRoots $clientToolsRoots
@@ -97,7 +99,7 @@ if (-not $dlib) {
 if (-not $dlib -or -not (Test-Path $dlib)) {
     throw ("Azure.CodeSigning.Dlib.dll not found. Install the Artifact Signing client tools:`n" +
         "  winget install -e --id Microsoft.Azure.ArtifactSigningClientTools`n" +
-        "or `nuget install Microsoft.ArtifactSigning.Client`, or set AZURE_SIGN_DLIB.")
+        "or 'nuget install Microsoft.ArtifactSigning.Client', or set AZURE_SIGN_DLIB.")
 }
 
 Write-Host "signtool: $signtool"

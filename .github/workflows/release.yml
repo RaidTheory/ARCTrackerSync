@@ -13,10 +13,12 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
     runs-on: windows-latest
+    environment: release
 
     steps:
       - name: Checkout
@@ -31,15 +33,19 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       # Must run before staging/zipping: the self-updater verifies the zip's
       # SHA256, so the exe has to carry its signature before it is hashed.
       - name: Sign executable (Azure Artifact Signing)
         uses: azure/artifact-signing-action@v2
         with:
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          endpoint: https://wus2.codesigning.azure.net
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.SIGNING_ACCOUNT_NAME }}
           certificate-profile-name: ${{ vars.SIGNING_CERT_PROFILE_NAME }}
           files: ${{ github.workspace }}\target\release\arctracker-sync.exe
@@ -112,8 +118,8 @@ jobs:
             ### Contents
             - `arctracker-sync.exe`
             - `README.md`, `LICENSE`, `THIRD-PARTY-NOTICES.md`
-            - `SHA256SUMS` — checksum of the zip; the app's self-updater verifies downloads against it
+            - `SHA256SUMS` - checksum of the zip; the app's self-updater verifies downloads against it
 
-            Licensed under the PolyForm Noncommercial License 1.0.0 — free for
+            Licensed under the PolyForm Noncommercial License 1.0.0 - free for
             noncommercial use. Commercial use requires a separate license; contact
             matt@arctracker.io.

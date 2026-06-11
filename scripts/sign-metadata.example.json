@@ -1,5 +1,5 @@
 {
-  "Endpoint": "https://wus2.codesigning.azure.net",
+  "Endpoint": "<your region endpoint, e.g. https://wus2.codesigning.azure.net>",
   "CodeSigningAccountName": "<your signing account name>",
   "CertificateProfileName": "<your certificate profile name>",
   "ExcludeCredentials": [
