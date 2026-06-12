@@ -26,9 +26,9 @@ use crate::theme::{
 };
 use crate::token::TokenObservation;
 use crate::tr;
-use crate::tray::{self, TrayCommand, TrayController};
 #[cfg(windows)]
 use crate::tray::TrayCommandHandler;
+use crate::tray::{self, TrayCommand, TrayController};
 use crate::updater::{self, InstallProgress, ReleaseInfo};
 use crate::widgets::{
     arc_modal, back_button, clickable_pill, hairline, icon_tile, inline_check, launcher_segment,
