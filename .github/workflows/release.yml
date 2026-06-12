@@ -107,6 +107,10 @@ jobs:
           files: |
             ${{ steps.stage.outputs.zip }}
             SHA256SUMS
+          # Append an auto-generated "What's Changed" list (merged PRs since the
+          # previous tag) below the static body. PR titles are the source, so
+          # keep them descriptive.
+          generate_release_notes: true
           body: |
             ## ARCTracker Sync ${{ steps.version.outputs.version }}
 
