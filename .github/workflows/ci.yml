@@ -41,3 +41,36 @@ jobs:
       # locally from an elevated shell.
       - name: Compile tests
         run: cargo test --no-run --locked
+
+  check-linux:
+    name: clippy + build + tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # eframe/tray pull in GTK, libxdo and the Ayatana app-indicator at build
+      # time; the runner image doesn't ship their -dev packages.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev pkg-config
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --locked
+
+      # No requireAdministrator manifest on Linux, so the tests actually run
+      # here (the Windows job can only compile them).
+      - name: Tests
+        run: cargo test --locked

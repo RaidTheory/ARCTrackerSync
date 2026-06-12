@@ -5,8 +5,9 @@ date while you play ARC Raiders. It signs you into ARCTracker, helps you start
 the game from Steam or Epic, and then connects your game account so ARCTracker
 can sync your inventory automatically in the background.
 
-It runs as a small Windows desktop app with a tray icon. Once it's set up, you
-mostly leave it alone — open it, start your game, and play.
+It runs as a small desktop app — a polished Windows build with a tray icon, plus
+a build-from-source option for Linux (ARC Raiders via Proton). Once it's set up,
+you mostly leave it alone — open it, start your game, and play.
 
 > **License:** ARCTracker Sync is **free for noncommercial use** under the
 > PolyForm Noncommercial License 1.0.0. **Commercial use requires a separate
@@ -59,10 +60,12 @@ ARCTracker sign-in is kept in Windows Credential Manager.
 ### Why it needs Administrator
 
 To notice your game account connecting, ARCTracker Sync watches your own
-computer's network traffic using Windows raw sockets, which Windows only allows
-with Administrator rights. By default there's no kernel driver, bundled network
-library, or extra capture tool to install — and it only ever looks at traffic on
-your own machine.
+computer's network traffic using raw sockets, which the OS only allows with
+elevated privileges. On Windows that means Administrator rights; on Linux it
+means the `CAP_NET_RAW` capability (granted with a one-time `setcap`, or by
+running as root) — see [Linux](#linux-arc-raiders-via-proton). By default
+there's no kernel driver, bundled network library, or extra capture tool to
+install — and it only ever looks at traffic on your own machine.
 
 ### Optional: Npcap capture
 
@@ -99,6 +102,35 @@ The app ships a manifest that requests elevation, so it runs as Administrator
 (required for the raw-socket capture described above). No kernel driver or
 external tooling is needed for the default raw-socket capture; the optional
 Npcap capture method uses Npcap's driver, installed separately by the user.
+
+### Linux (ARC Raiders via Proton)
+
+Windows is the primary, prebuilt target. Linux is supported as a
+**build-from-source** option for running ARC Raiders through Proton — there is
+no Linux release binary, so you compile it yourself. The audience here is
+already comfortable in a terminal (you're running a Proton game), so this is a
+script, not an installer.
+
+Prerequisites:
+
+- A stable Rust toolchain (install via [rustup](https://rustup.rs/)).
+- The GUI's system libraries: GTK 3, libxdo, and the Ayatana app-indicator
+  (`libgtk-3-dev`, `libxdo-dev`, `libayatana-appindicator3-dev` on Debian/Ubuntu;
+  the equivalents on your distro).
+- ARC Raiders on **Steam** (the Epic launcher isn't supported on Linux).
+
+From the repository root:
+
+```bash
+./scripts/run-linux.sh
+```
+
+That builds the release binary, grants it `CAP_NET_RAW` with a one-time
+`sudo setcap cap_net_raw+ep` (so the GUI itself runs unprivileged, the Linux
+equivalent of the Windows Administrator requirement), and launches it.
+
+See [docs/LINUX.md](docs/LINUX.md) for how capture works under Proton, the
+`SSLKEYLOGFILE` setup, a capture smoke test, and current caveats.
 
 ## Contributing
 
