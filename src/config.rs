@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::capture_backend::CaptureMethod;
 use crate::launch::LauncherPlatform;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,9 @@ pub struct AppConfig {
     /// Whether closing the window hides to tray instead of quitting (default on).
     #[serde(default = "default_keep_in_tray")]
     pub keep_in_tray: bool,
+    /// Packet-capture backend. Raw sockets unless the user opts into Npcap.
+    #[serde(default)]
+    pub capture_method: CaptureMethod,
 }
 
 fn default_keep_in_tray() -> bool {
@@ -34,6 +38,7 @@ impl Default for AppConfig {
             platform: LauncherPlatform::default(),
             language: None,
             keep_in_tray: default_keep_in_tray(),
+            capture_method: CaptureMethod::default(),
         }
     }
 }
@@ -289,6 +294,7 @@ mod tests {
             platform: LauncherPlatform::Steam,
             language: Some("de".to_string()),
             keep_in_tray: false,
+            capture_method: CaptureMethod::Npcap,
         };
 
         let json = serde_json::to_string(&config).expect("serialize config");
@@ -301,6 +307,7 @@ mod tests {
         assert_eq!(decoded.platform, LauncherPlatform::Steam);
         assert_eq!(decoded.language.as_deref(), Some("de"));
         assert!(!decoded.keep_in_tray);
+        assert_eq!(decoded.capture_method, CaptureMethod::Npcap);
     }
 
     #[test]
@@ -311,5 +318,6 @@ mod tests {
         let legacy: AppConfig = serde_json::from_str("{}").expect("deserialize legacy config");
         assert!(legacy.keep_in_tray);
         assert!(legacy.language.is_none());
+        assert_eq!(legacy.capture_method, CaptureMethod::RawSocket);
     }
 }

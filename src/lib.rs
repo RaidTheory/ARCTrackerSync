@@ -21,6 +21,7 @@ pub mod firewall;
 pub mod fonts;
 pub mod i18n;
 pub mod launch;
+pub mod npcap;
 pub mod packet;
 pub mod process_env;
 pub mod rawsock;

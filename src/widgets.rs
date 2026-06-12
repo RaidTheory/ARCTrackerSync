@@ -140,13 +140,18 @@ pub fn settings_row(
 ) {
     ui.add_space(SPACE_XS);
     ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new(label).color(arc_foreground()));
-            if !sub.is_empty() {
-                ui.label(RichText::new(sub).size(TEXT_CAPTION).color(arc_fg_dim()));
-            }
+        // Lay the control out from the right edge first so the remaining width
+        // bounds the text column — a long sub-label (or translation) wraps
+        // instead of running underneath the control.
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            add_control(ui);
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                ui.label(RichText::new(label).color(arc_foreground()));
+                if !sub.is_empty() {
+                    ui.label(RichText::new(sub).size(TEXT_CAPTION).color(arc_fg_dim()));
+                }
+            });
         });
-        ui.with_layout(Layout::right_to_left(Align::Center), add_control);
     });
     ui.add_space(SPACE_XS);
 }

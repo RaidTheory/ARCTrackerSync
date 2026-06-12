@@ -12,12 +12,14 @@ use eframe::egui::{
 
 use crate::auth_bridge;
 use crate::capture::{self, CaptureEvent, CaptureHandle, CaptureStats, InterfaceInfo};
+use crate::capture_backend::CaptureMethod;
 use crate::config::{self, AppConfig};
 use crate::credential_store;
 use crate::elevation;
 use crate::fonts;
 use crate::i18n;
 use crate::launch::{self, LauncherPlatform, LauncherStatus};
+use crate::npcap::Npcap;
 use crate::single_instance;
 use crate::sync_client::{self, SubmitError, SubmitResponse, BASE_URL};
 use crate::theme::{
@@ -47,6 +49,8 @@ const GAME_PROCESS_NAMES: &[&str] = &["PioneerGame.exe", "PioneerGame-e.exe", "P
 const HELP_URL: &str = "https://arctracker.io/help/sync";
 /// Where a synced user goes to view their inventory on the web app.
 const STASH_URL: &str = "https://arctracker.io/stash";
+/// Where the user installs Npcap from; never bundled or downloaded by the app.
+const NPCAP_URL: &str = "https://npcap.com/#download";
 /// Refresh the bridge token when fewer than this many days remain.
 const REFRESH_THRESHOLD_DAYS: i64 = 7;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -213,6 +217,10 @@ extern "system" {
 pub struct ArcTrackerSyncApp {
     config: AppConfig,
     locale: String,
+    /// True once the heavier all-CJK font stack has been loaded so the language
+    /// picker renders every native name. Loaded lazily the first time that
+    /// dropdown opens, then kept for the session so reopening never flickers.
+    picker_fonts_loaded: bool,
     screen: Screen,
     show_activity_log: bool,
     show_explainer: bool,
@@ -260,6 +268,10 @@ pub struct ArcTrackerSyncApp {
 
     capture: Option<CaptureHandle>,
     capture_blocked: bool,
+    /// TTL-cached `Npcap::is_installed()`; `None` until first probed. Only
+    /// maintained while the Npcap capture method is selected.
+    npcap_available: Option<bool>,
+    last_npcap_check: Instant,
     stats: CaptureStats,
     latest_token: Option<TokenObservation>,
     auth_token: Option<String>,
@@ -381,6 +393,7 @@ impl ArcTrackerSyncApp {
         let mut app = Self {
             config,
             locale,
+            picker_fonts_loaded: false,
             screen: Screen::Hub,
             show_activity_log: false,
             show_explainer: false,
@@ -416,6 +429,11 @@ impl ArcTrackerSyncApp {
                 .unwrap_or_else(Instant::now),
             capture: None,
             capture_blocked: false,
+            npcap_available: None,
+            // Backdated so the first frame probes immediately.
+            last_npcap_check: Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now),
             stats: CaptureStats::default(),
             latest_token: None,
             auth_token,
@@ -603,9 +621,32 @@ impl ArcTrackerSyncApp {
         self.save_config();
         self.locale = resolved;
         i18n::set_active_locale(&self.locale);
-        fonts::apply_locale(ctx, &self.locale);
+        self.apply_locale_fonts(ctx);
         self.tray_tooltip = String::new();
         self.update_tray_tooltip();
+    }
+
+    /// Rebuild the font stack for the active locale, preserving the all-CJK set
+    /// if the language picker has already pulled it in this session.
+    fn apply_locale_fonts(&self, ctx: &egui::Context) {
+        if self.picker_fonts_loaded {
+            fonts::apply_locale_with_all_cjk(ctx, &self.locale);
+        } else {
+            fonts::apply_locale(ctx, &self.locale);
+        }
+    }
+
+    /// Load the all-CJK font stack the first time the language picker opens, so
+    /// the non-active CJK native names stop rendering as tofu.
+    fn ensure_picker_fonts(&mut self, ctx: &egui::Context) {
+        if self.picker_fonts_loaded {
+            return;
+        }
+        self.picker_fonts_loaded = true;
+        fonts::apply_locale_with_all_cjk(ctx, &self.locale);
+        // The new fonts apply next frame; repaint so the just-opened picker
+        // shows the native names without waiting for the next input event.
+        ctx.request_repaint();
     }
 
     // ----- silent refresh ----------------------------------------------------------
@@ -644,6 +685,7 @@ impl ArcTrackerSyncApp {
         self.maybe_retry_token_submission();
         self.poll_refresh();
         self.refresh_launcher_readiness_if_needed();
+        self.refresh_npcap_available_if_needed();
         self.refresh_game_running_if_needed();
         self.maybe_refresh_auth_on_timer();
         self.maybe_check_for_update();
@@ -952,7 +994,11 @@ impl ArcTrackerSyncApp {
             ),
             HubState::NeedsAttention => (
                 tr!("SyncApp.state.needsAttention.title"),
-                tr!("SyncApp.state.needsAttention.body"),
+                if self.npcap_known_missing() {
+                    tr!("SyncApp.state.needsAttention.npcapBody")
+                } else {
+                    tr!("SyncApp.state.needsAttention.body")
+                },
             ),
         }
     }
@@ -1137,6 +1183,29 @@ impl ArcTrackerSyncApp {
         if self.last_launcher_check.elapsed() >= Duration::from_secs(2) {
             self.refresh_launcher_readiness();
         }
+    }
+
+    /// TTL-gated `Npcap::is_installed()` probe; only runs while the Npcap
+    /// capture method is selected. The 2s re-check means the "Npcap missing"
+    /// warnings clear on their own shortly after the user installs it.
+    fn refresh_npcap_available_if_needed(&mut self) {
+        if self.config.capture_method != CaptureMethod::Npcap {
+            return;
+        }
+        if self.npcap_available.is_some()
+            && self.last_npcap_check.elapsed() < Duration::from_secs(2)
+        {
+            return;
+        }
+        self.npcap_available = Some(Npcap::is_installed());
+        self.last_npcap_check = Instant::now();
+    }
+
+    /// True when the user selected Npcap but it is not installed — the one
+    /// capture-blocked cause the app can name precisely (detected by state,
+    /// never by parsing error strings).
+    fn npcap_known_missing(&self) -> bool {
+        self.config.capture_method == CaptureMethod::Npcap && self.npcap_available == Some(false)
     }
 
     fn refresh_game_running(&mut self) {
@@ -1399,7 +1468,11 @@ impl ArcTrackerSyncApp {
 
         self.stats = CaptureStats::default();
         self.latest_token = None;
-        self.capture = Some(capture::start_capture(interface_name, sync_key_path));
+        self.capture = Some(capture::start_capture(
+            self.config.capture_method,
+            interface_name,
+            sync_key_path,
+        ));
     }
 
     fn capture_settings_changed(&mut self) {
@@ -1692,6 +1765,14 @@ impl ArcTrackerSyncApp {
             format!("Launcher detail: {}", self.launcher_readiness.detail),
             format!("Game running: {}", self.game_running),
             format!("Capture ready: {}", self.capture_ready()),
+            format!("Capture method: {}", self.config.capture_method.label()),
+            format!(
+                "Npcap: {}",
+                match Npcap::load() {
+                    Ok(npcap) => npcap.lib_version(),
+                    Err(_) => "not installed".to_string(),
+                }
+            ),
             format!("Account synced: {}", self.token_submitted),
             format!("Inventory sync enabled: {}", self.sync_enabled),
             format!("Connection active: {}", self.capture.is_some()),
@@ -2447,8 +2528,14 @@ impl ArcTrackerSyncApp {
                 }
             }
             HubState::NeedsAttention => {
+                if self.npcap_known_missing() {
+                    ui.hyperlink_to(tr!("SyncApp.settings.npcapLink"), NPCAP_URL);
+                    ui.add_space(4.0);
+                }
                 if primary_button(ui, &tr!("SyncApp.action.tryAgain")) {
                     self.capture_blocked = false;
+                    // Re-probe for Npcap in case the user just installed it.
+                    self.npcap_available = None;
                     // Resume submission if a prior episode hard-stopped, then
                     // re-attempt with the token we already have.
                     self.reset_submit_retry_state();
@@ -2737,7 +2824,7 @@ impl ArcTrackerSyncApp {
                     };
                     let mut chosen: Option<Option<String>> = None;
 
-                    egui::ComboBox::from_id_salt("settings_language_combo")
+                    let combo = egui::ComboBox::from_id_salt("settings_language_combo")
                         .selected_text(current_label)
                         .show_ui(ui, |ui| {
                             if ui
@@ -2758,9 +2845,16 @@ impl ArcTrackerSyncApp {
                                     chosen = Some(Some(locale.to_string()));
                                 }
                             }
-                        })
+                        });
+                    combo
                         .response
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                    // The popup is open this frame (the menu closure ran), so
+                    // pull in the CJK fonts the native-name list needs.
+                    if combo.inner.is_some() {
+                        self.ensure_picker_fonts(ctx);
+                    }
 
                     if let Some(language) = chosen {
                         self.change_language(ctx, language);
@@ -2825,6 +2919,63 @@ impl ArcTrackerSyncApp {
             if refresh {
                 self.refresh_interfaces();
                 self.refresh_sync_key_source();
+                self.npcap_available = None;
+            }
+
+            hairline(ui);
+
+            let mut chosen_method: Option<CaptureMethod> = None;
+            settings_row(
+                ui,
+                &tr!("SyncApp.settings.captureMethod"),
+                &tr!("SyncApp.settings.captureMethodSub"),
+                |ui| {
+                    ui.spacing_mut().interact_size.y = 30.0;
+                    let current_label = match self.config.capture_method {
+                        CaptureMethod::RawSocket => tr!("SyncApp.settings.captureRawSockets"),
+                        CaptureMethod::Npcap => tr!("SyncApp.settings.captureNpcap"),
+                    };
+                    egui::ComboBox::from_id_salt("settings_capture_method_combo")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for method in [CaptureMethod::RawSocket, CaptureMethod::Npcap] {
+                                let label = match method {
+                                    CaptureMethod::RawSocket => {
+                                        tr!("SyncApp.settings.captureRawSockets")
+                                    }
+                                    CaptureMethod::Npcap => tr!("SyncApp.settings.captureNpcap"),
+                                };
+                                if ui
+                                    .selectable_label(self.config.capture_method == method, label)
+                                    .clicked()
+                                    && self.config.capture_method != method
+                                {
+                                    chosen_method = Some(method);
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                },
+            );
+
+            if let Some(method) = chosen_method {
+                self.config.capture_method = method;
+                self.save_config();
+                self.npcap_available = None;
+                self.capture_settings_changed();
+            }
+
+            if self.npcap_known_missing() {
+                ui.label(
+                    RichText::new(tr!("SyncApp.settings.npcapMissing"))
+                        .size(theme::TEXT_CAPTION)
+                        .color(arc_warning()),
+                );
+                ui.hyperlink_to(
+                    RichText::new(tr!("SyncApp.settings.npcapLink")).size(theme::TEXT_CAPTION),
+                    NPCAP_URL,
+                );
             }
         });
     }

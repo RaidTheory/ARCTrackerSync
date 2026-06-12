@@ -14,6 +14,15 @@ listed below, each of which remains under its own license.
     TLS decryption and protocol-registration code). See
     [`vendor/pcapsql-core/LOCAL-MODIFICATIONS.md`](vendor/pcapsql-core/LOCAL-MODIFICATIONS.md).
 
+## Optional runtime dependency (not distributed)
+
+- **Npcap** — <https://npcap.com>
+  - An optional packet-capture driver the user can select in Settings as an
+    alternative to the built-in raw-socket capture. ARCTracker Sync never
+    bundles, downloads, or installs Npcap (its free license does not permit
+    redistribution); when selected, the app loads the user's own installed
+    `wpcap.dll` at runtime. Npcap remains under its own license.
+
 ## Statically linked dependencies
 
 The compiled `arctracker-sync.exe` statically links a number of open-source Rust
