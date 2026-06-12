@@ -1,6 +1,7 @@
 // Always use the GUI subsystem so no console window opens alongside the app.
 // (If logs are needed for debugging, route tracing to a file instead.)
-#![windows_subsystem = "windows"]
+// No-op off Windows; gated so the attribute only applies where it's meaningful.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use arctracker_sync::{app, config, i18n, single_instance};
 

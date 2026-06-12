@@ -535,9 +535,12 @@ mod linux {
                 let operstate = std::fs::read_to_string(entry.path().join("operstate"))
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
+                // Include the interface name: the picker shows `description`
+                // when present, so a bare "link up" would hide which NIC it is
+                // (every live interface would read identically).
                 let description = match operstate.as_str() {
                     "" | "unknown" => None,
-                    other => Some(format!("link {other}")),
+                    other => Some(format!("{name} (link {other})")),
                 };
                 // Prefer up/unknown links first so the picker's default is live.
                 let up = matches!(operstate.as_str(), "up" | "unknown" | "");
@@ -561,7 +564,10 @@ mod linux {
                 }
                 return Err(err).context("opening AF_PACKET socket");
             }
-            let capture = Capture { fd };
+            let capture = Capture {
+                fd,
+                buf: vec![0u8; RECV_BUF],
+            };
 
             let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
             addr.sll_family = libc::AF_PACKET as u16;
@@ -593,6 +599,9 @@ mod linux {
 
     pub struct Capture {
         fd: RawFd,
+        // Reused across reads: a 256 KiB zeroed allocation per frame would churn
+        // the allocator at gameplay packet rates.
+        buf: Vec<u8>,
     }
 
     impl Capture {
@@ -613,9 +622,14 @@ mod linux {
                 return Ok(None);
             }
 
-            let mut buf = vec![0u8; RECV_BUF];
-            let n =
-                unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            let n = unsafe {
+                libc::recv(
+                    self.fd,
+                    self.buf.as_mut_ptr() as *mut libc::c_void,
+                    self.buf.len(),
+                    0,
+                )
+            };
             if n < 0 {
                 let err = std::io::Error::last_os_error();
                 return match err.raw_os_error() {
@@ -624,12 +638,11 @@ mod linux {
                 };
             }
             let captured = n as usize;
-            buf.truncate(captured);
             Ok(Some(Packet {
                 timestamp_us: now_micros(),
                 captured_len: captured as u32,
                 original_len: captured as u32,
-                data: buf,
+                data: self.buf[..captured].to_vec(),
             }))
         }
 

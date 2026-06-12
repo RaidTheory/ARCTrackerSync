@@ -713,6 +713,12 @@ impl ArcTrackerSyncApp {
     }
 
     fn maybe_check_for_update(&mut self) {
+        // Self-update ships only a Windows release; the installer extracts
+        // `arctracker-sync.exe` from the zip, which a Linux build would never
+        // match. Linux runs from a source build, so don't check or offer one.
+        if !cfg!(windows) {
+            return;
+        }
         if self.update_check_rx.is_some() || self.update_progress_rx.is_some() {
             return;
         }
@@ -951,7 +957,14 @@ impl ArcTrackerSyncApp {
         match state {
             HubState::NeedsAdmin => (
                 tr!("SyncApp.state.needsAdmin.title"),
-                tr!("SyncApp.state.needsAdmin.body"),
+                // Windows gates raw-socket capture behind Administrator; Linux
+                // gates it behind CAP_NET_RAW (setcap/root), so the explanation
+                // and the action differ by platform.
+                if cfg!(windows) {
+                    tr!("SyncApp.state.needsAdmin.body")
+                } else {
+                    tr!("SyncApp.state.needsAdmin.bodyLinux")
+                },
             ),
             HubState::SignedOut => (
                 tr!("SyncApp.state.signedOut.title"),
@@ -995,7 +1008,12 @@ impl ArcTrackerSyncApp {
             ),
             HubState::SyncedIdle => (
                 tr!("SyncApp.state.synced.title"),
-                tr!("SyncApp.state.syncedIdle.body"),
+                // No system tray off Windows, so don't claim it runs "in the tray".
+                if cfg!(windows) {
+                    tr!("SyncApp.state.syncedIdle.body")
+                } else {
+                    tr!("SyncApp.state.syncedIdle.bodyLinux")
+                },
             ),
             HubState::NeedsLauncher => (
                 tr!("SyncApp.state.needsLauncher.title", launcher => self.effective_platform().label()),
@@ -2182,9 +2200,14 @@ impl ArcTrackerSyncApp {
                     }
                     ui.add_space(theme::SPACE_SM);
                     ui.label(
-                        RichText::new(tr!("SyncApp.state.synced.canClose"))
-                            .size(theme::TEXT_SECONDARY)
-                            .color(arc_muted_text()),
+                        RichText::new(if cfg!(windows) {
+                            tr!("SyncApp.state.synced.canClose")
+                        } else {
+                            // Closing quits on Linux (no tray to hide into).
+                            tr!("SyncApp.state.synced.canCloseLinux")
+                        })
+                        .size(theme::TEXT_SECONDARY)
+                        .color(arc_muted_text()),
                     );
                 }
 
@@ -2474,7 +2497,12 @@ impl ArcTrackerSyncApp {
     fn render_hero_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: HubState) {
         ui.horizontal(|ui| match state {
             HubState::NeedsAdmin => {
-                if primary_button(ui, &tr!("SyncApp.action.restartAsAdmin")) {
+                let elevate_label = if cfg!(windows) {
+                    tr!("SyncApp.action.restartAsAdmin")
+                } else {
+                    tr!("SyncApp.action.grantCapture")
+                };
+                if primary_button(ui, &elevate_label) {
                     match elevation::relaunch_elevated() {
                         Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                         Err(error) => self.push_message(format!("{error:#}")),
@@ -2829,6 +2857,11 @@ impl ArcTrackerSyncApp {
     }
 
     fn render_settings_startup(&mut self, ui: &mut egui::Ui) {
+        // The only startup option is "keep running in the tray", which is a
+        // no-op off Windows (no tray; closing the window quits). Hide the card.
+        if !cfg!(windows) {
+            return;
+        }
         settings_card(ui, &tr!("SyncApp.settings.startup"), |ui| {
             let mut keep_in_tray = self.config.keep_in_tray;
             settings_row(
@@ -2846,15 +2879,27 @@ impl ArcTrackerSyncApp {
     }
 
     fn render_settings_language(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The default tracks the OS UI language; name the OS for the platform.
+        let (matches_default, match_default) = if cfg!(windows) {
+            (
+                tr!("SyncApp.settings.matchesWindows"),
+                tr!("SyncApp.settings.matchWindows"),
+            )
+        } else {
+            (
+                tr!("SyncApp.settings.matchesSystem"),
+                tr!("SyncApp.settings.matchSystem"),
+            )
+        };
         settings_card(ui, &tr!("SyncApp.settings.language"), |ui| {
             settings_row(
                 ui,
                 &tr!("SyncApp.settings.displayLanguage"),
-                &tr!("SyncApp.settings.matchesWindows"),
+                &matches_default,
                 |ui| {
                     let current_label = match self.config.language.as_deref() {
                         Some(code) => i18n::native_name(code).to_string(),
-                        None => tr!("SyncApp.settings.matchWindows"),
+                        None => match_default.clone(),
                     };
                     let mut chosen: Option<Option<String>> = None;
 
@@ -2862,10 +2907,7 @@ impl ArcTrackerSyncApp {
                         .selected_text(current_label)
                         .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(
-                                    self.config.language.is_none(),
-                                    tr!("SyncApp.settings.matchWindows"),
-                                )
+                                .selectable_label(self.config.language.is_none(), &match_default)
                                 .clicked()
                             {
                                 chosen = Some(None);
@@ -2965,18 +3007,29 @@ impl ArcTrackerSyncApp {
                 &tr!("SyncApp.settings.captureMethodSub"),
                 |ui| {
                     ui.spacing_mut().interact_size.y = 30.0;
+                    let raw_socket_label = if cfg!(windows) {
+                        tr!("SyncApp.settings.captureRawSockets")
+                    } else {
+                        tr!("SyncApp.settings.captureRawSocketsLinux")
+                    };
                     let current_label = match self.config.capture_method {
-                        CaptureMethod::RawSocket => tr!("SyncApp.settings.captureRawSockets"),
+                        CaptureMethod::RawSocket => raw_socket_label.clone(),
                         CaptureMethod::Npcap => tr!("SyncApp.settings.captureNpcap"),
                     };
+                    // Npcap is a Windows-only alternative (wpcap.dll); off
+                    // Windows the only backend is the AF_PACKET raw socket, so
+                    // don't offer a method whose `load()` would just fail.
+                    #[cfg(windows)]
+                    let methods: &[CaptureMethod] =
+                        &[CaptureMethod::RawSocket, CaptureMethod::Npcap];
+                    #[cfg(not(windows))]
+                    let methods: &[CaptureMethod] = &[CaptureMethod::RawSocket];
                     egui::ComboBox::from_id_salt("settings_capture_method_combo")
                         .selected_text(current_label)
                         .show_ui(ui, |ui| {
-                            for method in [CaptureMethod::RawSocket, CaptureMethod::Npcap] {
+                            for &method in methods {
                                 let label = match method {
-                                    CaptureMethod::RawSocket => {
-                                        tr!("SyncApp.settings.captureRawSockets")
-                                    }
+                                    CaptureMethod::RawSocket => raw_socket_label.clone(),
                                     CaptureMethod::Npcap => tr!("SyncApp.settings.captureNpcap"),
                                 };
                                 if ui
