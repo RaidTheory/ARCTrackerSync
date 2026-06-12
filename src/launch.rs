@@ -465,6 +465,7 @@ fn graceful_close_launcher(plan: &LauncherSetupPlan) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn force_close_processes(processes: &[LauncherProcess]) -> Result<()> {
     let Some(process_name) = processes.first().map(|process| process.name.as_str()) else {
         return Ok(());
@@ -479,6 +480,17 @@ fn force_close_processes(processes: &[LauncherProcess]) -> Result<()> {
     Ok(())
 }
 
+/// Linux has no `taskkill`; send `SIGKILL` to each matched PID directly.
+#[cfg(target_os = "linux")]
+fn force_close_processes(processes: &[LauncherProcess]) -> Result<()> {
+    for process in processes {
+        unsafe {
+            libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    Ok(())
+}
+
 fn wait_until_process_exits(process_name: &str, timeout: Duration) -> Result<bool> {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -490,6 +502,7 @@ fn wait_until_process_exits(process_name: &str, timeout: Duration) -> Result<boo
     Ok(process_env::find_processes(process_name)?.is_empty())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn find_steam_exe() -> Result<PathBuf> {
     if let Some(path) = config::steam_install_path().map(|path| path.join("steam.exe")) {
         if path.exists() {
@@ -507,6 +520,29 @@ fn find_steam_exe() -> Result<PathBuf> {
     }
 
     Err(anyhow!("Steam was not found"))
+}
+
+/// On Linux Steam is the `steam` wrapper script on `PATH`. Returning the bare
+/// command lets `Command::new` resolve it, and `steam -shutdown` /
+/// `steam steam://...` work the same as the Windows exe path.
+#[cfg(target_os = "linux")]
+fn find_steam_exe() -> Result<PathBuf> {
+    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join("steam");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    // Flatpak fallback: no `steam` on PATH, but the app id is launchable.
+    if Path::new("/var/lib/flatpak/exports/bin/com.valvesoftware.Steam").exists() {
+        return Ok(PathBuf::from(
+            "/var/lib/flatpak/exports/bin/com.valvesoftware.Steam",
+        ));
+    }
+    Err(anyhow!("Steam was not found on PATH"))
 }
 
 fn find_epic_launcher_exe() -> Result<PathBuf> {

@@ -44,6 +44,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 raw-window-handle = "0.6"
 tray-icon = "0.19"
 
+[target.'cfg(unix)'.dependencies]
+# Linux/Proton backend: AF_PACKET capture, /proc process inspection, geteuid.
+libc = "0.2"
+
 [dev-dependencies]
 # tests/release_pipeline.rs authors release zips and checksums for its in-process
 # server. The integration-test target gets no manifest — see lib.rs.

@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+#[cfg(windows)]
 const TARGET_NAME: &str = "ARCTracker Sync Desktop Session";
 
 #[cfg(windows)]
@@ -17,17 +18,83 @@ pub fn clear_auth_token() -> Result<()> {
     windows_credential_store::clear(TARGET_NAME)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn load_auth_token() -> Result<Option<String>> {
+    let path = linux_token_store::token_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(token) => {
+            let token = token.trim();
+            Ok((!token.is_empty()).then(|| token.to_string()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display())),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn save_auth_token(token: &str) -> Result<()> {
+    linux_token_store::save(token)
+}
+
+#[cfg(target_os = "linux")]
+pub fn clear_auth_token() -> Result<()> {
+    let path = linux_token_store::token_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).map_err(|e| anyhow::anyhow!("deleting {}: {e}", path.display())),
+    }
+}
+
+/// No OS keyring on Linux without a dbus/secret-service dependency, so the
+/// ArcTracker session token is persisted to a `0600` file in the app's data
+/// directory — readable only by the owning user, the same trust boundary as
+/// Windows Credential Manager's per-user store.
+#[cfg(target_os = "linux")]
+mod linux_token_store {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::PathBuf;
+
+    use anyhow::{anyhow, Context, Result};
+    use directories::ProjectDirs;
+
+    pub fn token_path() -> Result<PathBuf> {
+        let dirs = ProjectDirs::from("io", "ArcTracker", "Sync")
+            .ok_or_else(|| anyhow!("could not resolve app data path"))?;
+        Ok(dirs.data_local_dir().join("session-token"))
+    }
+
+    pub fn save(token: &str) -> Result<()> {
+        let path = token_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.write_all(token.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn load_auth_token() -> Result<Option<String>> {
     Ok(None)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn save_auth_token(_token: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn clear_auth_token() -> Result<()> {
     Ok(())
 }

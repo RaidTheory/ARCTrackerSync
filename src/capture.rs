@@ -295,6 +295,8 @@ fn capture_loop(
     let mut last_sync_key_check = Instant::now();
     let mut last_stats_emit = Instant::now();
     let mut last_connection_cleanup = Instant::now();
+    // Throttle for the stream-buffer memory-limit warning (edge + 30 s cadence).
+    let mut last_mem_warn: Option<Instant> = None;
     // Tracks the poll error state so a persistently unreadable sync key emits
     // one status on the way in and one on recovery, not one per second.
     let mut sync_key_poll_failing = false;
@@ -399,6 +401,22 @@ fn capture_loop(
             for removed in manager.cleanup_timeout(now_micros()) {
                 embark_connections.remove(&removed.id);
             }
+        }
+
+        // Report the stream-buffer memory limit at most once per 30 s, and once
+        // when it clears — gameplay keeps many high-volume Embark TLS streams
+        // open, so a per-segment check would spam tens of thousands of lines.
+        let over_limit = manager.memory_limit_exceeded();
+        if over_limit && last_mem_warn.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
+            last_mem_warn = Some(Instant::now());
+            let _ = tx.send(CaptureEvent::Status(
+                "Stream memory limit exceeded; waiting for connection cleanup".to_string(),
+            ));
+        } else if !over_limit && last_mem_warn.is_some() {
+            last_mem_warn = None;
+            let _ = tx.send(CaptureEvent::Status(
+                "Stream memory back within limit".to_string(),
+            ));
         }
 
         if last_stats_emit.elapsed() >= Duration::from_millis(500) {
@@ -576,11 +594,9 @@ fn process_segment(
         }
     }
 
-    if manager.memory_limit_exceeded() {
-        let _ = tx.send(CaptureEvent::Status(
-            "Stream memory limit exceeded; waiting for connection cleanup".to_string(),
-        ));
-    }
+    // NB: the memory-limit warning is emitted from the main capture loop on an
+    // edge/time throttle, not here — this runs per-segment and would otherwise
+    // flood the log with tens of thousands of identical lines during gameplay.
     let _ = tx.send(CaptureEvent::Stats(stats.clone()));
 }
 

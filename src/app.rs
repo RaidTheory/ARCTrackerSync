@@ -28,7 +28,9 @@ use crate::theme::{
 };
 use crate::token::TokenObservation;
 use crate::tr;
-use crate::tray::{self, TrayCommand, TrayCommandHandler, TrayController};
+#[cfg(windows)]
+use crate::tray::TrayCommandHandler;
+use crate::tray::{self, TrayCommand, TrayController};
 use crate::updater::{self, InstallProgress, ReleaseInfo};
 use crate::widgets::{
     arc_modal, back_button, clickable_pill, hairline, icon_tile, inline_check, launcher_segment,
@@ -500,6 +502,13 @@ impl ArcTrackerSyncApp {
 
     // ----- tray / window lifecycle -------------------------------------------------
 
+    /// No system tray off Windows: leave `self.tray` as None so the window-close
+    /// button quits instead of hiding the window into a tray that isn't there
+    /// (which left the process running with no way to bring it back).
+    #[cfg(not(windows))]
+    fn init_tray(&mut self, _app: Weak<Mutex<ArcTrackerSyncApp>>, _ctx: egui::Context) {}
+
+    #[cfg(windows)]
     fn init_tray(&mut self, app: Weak<Mutex<ArcTrackerSyncApp>>, ctx: egui::Context) {
         let handler: TrayCommandHandler = Arc::new(move |command| {
             let Some(app) = app.upgrade() else {
@@ -1981,6 +1990,27 @@ impl ArcTrackerSyncApp {
         .to_ascii_lowercase();
 
         let mut score = 0;
+
+        // Link state dominates: a down interface (e.g. unused Wi-Fi while on
+        // Ethernet) must never win over the live one. The Linux backend encodes
+        // this in the description as "link up" / "link down"; on Windows the
+        // adapter list is already up-only, so these simply don't match.
+        if text.contains("link up") {
+            score += 100;
+        }
+        if text.contains("link down") {
+            score -= 100;
+        }
+
+        // Linux interface-name prefixes (predictable names + legacy): wired
+        // en*/eth*, wireless wl*/wlan*. Without these, `enp7s0`/`wlan0` score 0
+        // and ties resolve to the last (often-down) interface.
+        for (prefix, bonus) in [("en", 20), ("eth", 20), ("wl", 15)] {
+            if interface.name.starts_with(prefix) {
+                score += bonus;
+            }
+        }
+
         for preferred in [
             "ethernet", "wi-fi", "wifi", "wireless", "gigabit", "realtek", "intel", "asix",
         ] {
@@ -2498,7 +2528,9 @@ impl ArcTrackerSyncApp {
                 }
             }
             HubState::LauncherReady => {
-                if secondary_button(ui, &tr!("SyncApp.action.hideToTray")) {
+                if self.tray.is_some()
+                    && secondary_button(ui, &tr!("SyncApp.action.hideToTray"))
+                {
                     self.hide_to_tray(ctx);
                 }
             }
@@ -2512,7 +2544,9 @@ impl ArcTrackerSyncApp {
                 if primary_button(ui, &tr!("SyncApp.action.viewStash")) {
                     let _ = auth_bridge::open_browser(STASH_URL);
                 }
-                if secondary_button(ui, &tr!("SyncApp.action.hideToTray")) {
+                if self.tray.is_some()
+                    && secondary_button(ui, &tr!("SyncApp.action.hideToTray"))
+                {
                     self.hide_to_tray(ctx);
                 }
             }

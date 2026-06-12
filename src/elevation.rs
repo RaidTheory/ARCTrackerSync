@@ -114,7 +114,94 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod stub {
+    use anyhow::{anyhow, Result};
+
+    /// Capture needs `CAP_NET_RAW`. Root always has it; otherwise probe by
+    /// opening an `AF_PACKET` socket, which succeeds only when the capability is
+    /// present (e.g. via `setcap cap_net_raw+ep`). This drives the readiness
+    /// gate the same way the Windows admin check does.
+    pub fn is_elevated() -> bool {
+        if unsafe { libc::geteuid() } == 0 {
+            return true;
+        }
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW,
+                (libc::ETH_P_ALL as u16).to_be() as i32,
+            )
+        };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Grant the capture capability via a single graphical `pkexec` prompt, then
+    /// restart as the same user. We do NOT run the GUI itself under `pkexec`:
+    /// a root process loses access to the user's Wayland/X session (pkexec
+    /// scrubs the environment), so the window would never appear. Instead we
+    /// `setcap cap_net_raw+ep` the binary file — that capability is picked up on
+    /// the next `exec`, so we re-launch as the normal user and exit this copy.
+    pub fn relaunch_elevated() -> Result<()> {
+        if is_elevated() {
+            return Ok(());
+        }
+        let exe = std::env::current_exe()?;
+        let setcap = find_setcap()
+            .ok_or_else(|| anyhow!("setcap not found — install libcap (it provides setcap)"))?;
+
+        let status = std::process::Command::new("pkexec")
+            .arg(setcap)
+            .arg("cap_net_raw+ep")
+            .arg(&exe)
+            .status()
+            .map_err(|error| {
+                anyhow!("could not run pkexec (install polkit, or run `sudo setcap cap_net_raw+ep {}`): {error}", exe.display())
+            })?;
+        if !status.success() {
+            // Non-zero also covers the user cancelling the password dialog.
+            return Err(anyhow!(
+                "granting the capture capability was cancelled or failed"
+            ));
+        }
+
+        // The file now carries CAP_NET_RAW; a fresh exec as this same user picks
+        // it up and keeps the user's display session.
+        std::process::Command::new(&exe)
+            .spawn()
+            .map_err(|error| anyhow!("restarting after granting capability: {error}"))?;
+        std::process::exit(0);
+    }
+
+    /// Locate the `setcap` binary. pkexec wants an absolute path, and `setcap`
+    /// lives in different places across distros (usr-merged Arch vs split /sbin).
+    fn find_setcap() -> Option<std::path::PathBuf> {
+        let candidates = [
+            "/usr/sbin/setcap",
+            "/sbin/setcap",
+            "/usr/bin/setcap",
+            "/bin/setcap",
+        ];
+        candidates
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|path| path.exists())
+            .or_else(|| {
+                std::env::var_os("PATH").and_then(|paths| {
+                    std::env::split_paths(&paths)
+                        .map(|dir| dir.join("setcap"))
+                        .find(|path| path.exists())
+                })
+            })
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 mod stub {
     use anyhow::{bail, Result};
 
