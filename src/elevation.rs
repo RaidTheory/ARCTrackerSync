@@ -114,7 +114,55 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod stub {
+    use anyhow::{anyhow, Result};
+
+    /// Capture needs `CAP_NET_RAW`. Root always has it; otherwise probe by
+    /// opening an `AF_PACKET` socket, which succeeds only when the capability is
+    /// present (e.g. via `setcap cap_net_raw+ep`). This drives the readiness
+    /// gate the same way the Windows admin check does.
+    pub fn is_elevated() -> bool {
+        if unsafe { libc::geteuid() } == 0 {
+            return true;
+        }
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW,
+                (libc::ETH_P_ALL as u16).to_be() as i32,
+            )
+        };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Re-launch the app through `pkexec` so a graphical sudo prompt grants the
+    /// capture capability for this run.
+    pub fn relaunch_elevated() -> Result<()> {
+        if is_elevated() {
+            return Ok(());
+        }
+        let exe = std::env::current_exe()?;
+        let status = std::process::Command::new("pkexec")
+            .arg(exe)
+            .status()
+            .map_err(|error| {
+                anyhow!("could not run pkexec (install polkit, or run the app with sudo): {error}")
+            })?;
+        if status.success() {
+            // The elevated copy now owns the session; exit this unprivileged one.
+            std::process::exit(0);
+        }
+        Err(anyhow!("pkexec did not grant elevation"))
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 mod stub {
     use anyhow::{bail, Result};
 

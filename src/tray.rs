@@ -25,6 +25,7 @@ pub type TrayCommandHandler = Arc<dyn Fn(TrayCommand) + Send + Sync + 'static>;
 
 /// Registry value name older releases wrote under the HKCU Run key for the
 /// removed "Start with Windows" feature; kept so we can clean it up.
+#[cfg(windows)]
 const RUN_VALUE_NAME: &str = "ARCTrackerSync";
 
 #[cfg(windows)]

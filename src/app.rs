@@ -1900,6 +1900,27 @@ impl ArcTrackerSyncApp {
         .to_ascii_lowercase();
 
         let mut score = 0;
+
+        // Link state dominates: a down interface (e.g. unused Wi-Fi while on
+        // Ethernet) must never win over the live one. The Linux backend encodes
+        // this in the description as "link up" / "link down"; on Windows the
+        // adapter list is already up-only, so these simply don't match.
+        if text.contains("link up") {
+            score += 100;
+        }
+        if text.contains("link down") {
+            score -= 100;
+        }
+
+        // Linux interface-name prefixes (predictable names + legacy): wired
+        // en*/eth*, wireless wl*/wlan*. Without these, `enp7s0`/`wlan0` score 0
+        // and ties resolve to the last (often-down) interface.
+        for (prefix, bonus) in [("en", 20), ("eth", 20), ("wl", 15)] {
+            if interface.name.starts_with(prefix) {
+                score += bonus;
+            }
+        }
+
         for preferred in [
             "ethernet", "wi-fi", "wifi", "wireless", "gigabit", "realtek", "intel", "asix",
         ] {

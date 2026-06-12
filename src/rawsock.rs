@@ -11,7 +11,10 @@
 #[cfg(windows)]
 pub use imp::{Capture, RawSock};
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub use linux::{Capture, RawSock};
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub use stub::{Capture, RawSock};
 
 #[cfg(windows)]
@@ -489,7 +492,189 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux capture backend using an `AF_PACKET`/`SOCK_RAW` socket bound to one
+/// interface. Delivers full Ethernet frames, reported as `DLT_EN10MB` so
+/// `packet.rs` strips the link layer itself. The socket needs `CAP_NET_RAW`
+/// (run as root, or `setcap cap_net_raw+ep` on the binary). Both directions are
+/// captured: `AF_PACKET` sees outbound frames as well as inbound, which is what
+/// the Windows `RCVALL_IPLEVEL` path also relies on.
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::os::raw::c_int;
+    use std::os::unix::io::RawFd;
+
+    use anyhow::{anyhow, bail, Context, Result};
+
+    use crate::capture_backend::{Device, Packet};
+    use crate::packet::DLT_EN10MB;
+
+    // Generous: a single GRO/LSO-coalesced frame on the wire can far exceed the
+    // 1500-byte MTU, and a short read silently truncates the segment.
+    const RECV_BUF: usize = 256 * 1024;
+
+    fn eth_p_all() -> u16 {
+        (libc::ETH_P_ALL as u16).to_be()
+    }
+
+    pub struct RawSock;
+
+    impl RawSock {
+        pub fn load() -> Result<Self> {
+            Ok(RawSock)
+        }
+
+        pub fn list_devices(&self) -> Result<Vec<Device>> {
+            let mut devices = Vec::new();
+            let entries = std::fs::read_dir("/sys/class/net")
+                .context("listing /sys/class/net network interfaces")?;
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == "lo" {
+                    continue;
+                }
+                let operstate = std::fs::read_to_string(entry.path().join("operstate"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let description = match operstate.as_str() {
+                    "" | "unknown" => None,
+                    other => Some(format!("link {other}")),
+                };
+                // Prefer up/unknown links first so the picker's default is live.
+                let up = matches!(operstate.as_str(), "up" | "unknown" | "");
+                devices.push((up, Device { name, description }));
+            }
+            devices.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+            Ok(devices.into_iter().map(|(_, device)| device).collect())
+        }
+
+        pub fn open_live(&self, name: &str) -> Result<Capture> {
+            let ifindex = if_index(name)?;
+            let fd =
+                unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, i32::from(eth_p_all())) };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EPERM) {
+                    bail!(
+                        "opening AF_PACKET socket needs CAP_NET_RAW — run as root, or \
+                         `sudo setcap cap_net_raw+ep` on the binary"
+                    );
+                }
+                return Err(err).context("opening AF_PACKET socket");
+            }
+            let capture = Capture { fd };
+
+            let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            addr.sll_family = libc::AF_PACKET as u16;
+            addr.sll_protocol = eth_p_all();
+            addr.sll_ifindex = ifindex;
+            let rc = unsafe {
+                libc::bind(
+                    fd,
+                    &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                )
+            };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("binding capture socket to {name}"));
+            }
+
+            // Non-blocking so the capture loop can poll for the stop flag.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("setting capture socket non-blocking");
+            }
+
+            Ok(capture)
+        }
+    }
+
+    pub struct Capture {
+        fd: RawFd,
+    }
+
+    impl Capture {
+        pub fn next_packet(&mut self) -> Result<Option<Packet>> {
+            // Wait for a frame with a bounded timeout rather than spinning: the
+            // capture loop calls this back-to-back, and the socket is
+            // non-blocking, so a bare `recv` would busy-loop at 100% CPU while
+            // idle. The 200 ms cap still lets the loop service its 500 ms/1 s
+            // housekeeping timers and the stop flag promptly.
+            let mut pfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
+            if ready <= 0 {
+                // 0 = timeout; <0 with EINTR = interrupted. Either way, no frame.
+                return Ok(None);
+            }
+
+            let mut buf = vec![0u8; RECV_BUF];
+            let n =
+                unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(None),
+                    _ => Err(err).context("reading from capture socket"),
+                };
+            }
+            let captured = n as usize;
+            buf.truncate(captured);
+            Ok(Some(Packet {
+                timestamp_us: now_micros(),
+                captured_len: captured as u32,
+                original_len: captured as u32,
+                data: buf,
+            }))
+        }
+
+        pub fn datalink(&self) -> Result<i32> {
+            Ok(DLT_EN10MB)
+        }
+
+        pub fn set_filter(&mut self, _expression: &str) -> Result<()> {
+            // No kernel BPF: the socket captures every frame on the interface and
+            // `packet.rs` discards anything that isn't TCP/443. A busy link costs
+            // some extra userspace parsing, but keeps the backend dependency-free
+            // and correct for VLAN-tagged and offloaded frames.
+            Ok(())
+        }
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    fn if_index(name: &str) -> Result<c_int> {
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| anyhow!("interface name {name:?} contains a NUL byte"))?;
+        let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+        if index == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("resolving interface index for {name}"));
+        }
+        Ok(index as c_int)
+    }
+
+    fn now_micros() -> i64 {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } != 0 {
+            return 0;
+        }
+        ts.tv_sec as i64 * 1_000_000 + ts.tv_nsec as i64 / 1_000
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 mod stub {
     use anyhow::{bail, Result};
 

@@ -15,7 +15,12 @@ pub fn find_processes(process_name: &str) -> Result<Vec<LauncherProcess>> {
     windows_process_env::find_processes(process_name)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn find_processes(process_name: &str) -> Result<Vec<LauncherProcess>> {
+    linux_process_env::find_processes(process_name)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn find_processes(_process_name: &str) -> Result<Vec<LauncherProcess>> {
     Ok(Vec::new())
 }
@@ -25,9 +30,96 @@ pub fn process_environment_value(pid: u32, name: &str) -> Result<Option<String>>
     windows_process_env::process_environment_value(pid, name)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn process_environment_value(pid: u32, name: &str) -> Result<Option<String>> {
+    linux_process_env::process_environment_value(pid, name)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn process_environment_value(_pid: u32, _name: &str) -> Result<Option<String>> {
     Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+mod linux_process_env {
+    use std::path::PathBuf;
+
+    use anyhow::Result;
+
+    use super::LauncherProcess;
+
+    /// Match a Windows-style launcher name (`steam.exe`) against a Linux process
+    /// comm (`steam`): case-insensitive, with a trailing `.exe` ignored on the
+    /// query side. So the cross-platform callers in `launch.rs` keep working
+    /// unchanged.
+    fn names_match(query: &str, comm: &str) -> bool {
+        let query = query.strip_suffix(".exe").unwrap_or(query);
+        comm.eq_ignore_ascii_case(query)
+    }
+
+    pub fn find_processes(process_name: &str) -> Result<Vec<LauncherProcess>> {
+        let mut processes = Vec::new();
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(entries) => entries,
+            Err(_) => return Ok(processes),
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(pid) = file_name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let proc_dir = entry.path();
+            let comm = std::fs::read_to_string(proc_dir.join("comm"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let exe = std::fs::read_link(proc_dir.join("exe")).ok();
+            let exe_matches = exe
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| names_match(process_name, n));
+            if !names_match(process_name, &comm) && !exe_matches {
+                continue;
+            }
+            let parent_pid = read_ppid(&proc_dir).unwrap_or(0);
+            processes.push(LauncherProcess {
+                pid,
+                parent_pid,
+                name: if comm.is_empty() {
+                    process_name.to_string()
+                } else {
+                    comm
+                },
+                executable_path: exe,
+            });
+        }
+        Ok(processes)
+    }
+
+    pub fn process_environment_value(pid: u32, name: &str) -> Result<Option<String>> {
+        let path = PathBuf::from(format!("/proc/{pid}/environ"));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            // EACCES on another user's process, or the process already exited.
+            Err(_) => return Ok(None),
+        };
+        let prefix = format!("{name}=");
+        for entry in bytes.split(|&byte| byte == 0) {
+            let text = String::from_utf8_lossy(entry);
+            if let Some(value) = text.strip_prefix(&prefix) {
+                return Ok(Some(value.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Field 4 of `/proc/<pid>/stat` is the parent PID. The comm field (2) is
+    /// parenthesised and may contain spaces, so split on the last `)`.
+    fn read_ppid(proc_dir: &std::path::Path) -> Option<u32> {
+        let stat = std::fs::read_to_string(proc_dir.join("stat")).ok()?;
+        let after_comm = stat.rsplit_once(')')?.1;
+        after_comm.split_whitespace().nth(1)?.parse().ok()
+    }
 }
 
 #[cfg(windows)]

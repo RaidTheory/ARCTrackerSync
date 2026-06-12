@@ -121,7 +121,23 @@ fn read_sync_key_path_from_registry() -> Option<PathBuf> {
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn read_steam_install_path() -> Option<PathBuf> {
+    // Steam on Linux installs under a couple of well-known locations; the
+    // `~/.steam/steam` symlink points at whichever is live. Return the first
+    // that holds a steamapps directory so library discovery works.
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let candidates = [
+        home.join(".steam/steam"),
+        home.join(".local/share/Steam"),
+        home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+    ];
+    candidates
+        .into_iter()
+        .find(|path| path.join("steamapps").is_dir())
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn read_steam_install_path() -> Option<PathBuf> {
     None
 }
