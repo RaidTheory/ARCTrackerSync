@@ -26,7 +26,9 @@ use crate::theme::{
 };
 use crate::token::TokenObservation;
 use crate::tr;
-use crate::tray::{self, TrayCommand, TrayCommandHandler, TrayController};
+use crate::tray::{self, TrayCommand, TrayController};
+#[cfg(windows)]
+use crate::tray::TrayCommandHandler;
 use crate::updater::{self, InstallProgress, ReleaseInfo};
 use crate::widgets::{
     arc_modal, back_button, clickable_pill, hairline, icon_tile, inline_check, launcher_segment,
@@ -482,6 +484,13 @@ impl ArcTrackerSyncApp {
 
     // ----- tray / window lifecycle -------------------------------------------------
 
+    /// No system tray off Windows: leave `self.tray` as None so the window-close
+    /// button quits instead of hiding the window into a tray that isn't there
+    /// (which left the process running with no way to bring it back).
+    #[cfg(not(windows))]
+    fn init_tray(&mut self, _app: Weak<Mutex<ArcTrackerSyncApp>>, _ctx: egui::Context) {}
+
+    #[cfg(windows)]
     fn init_tray(&mut self, app: Weak<Mutex<ArcTrackerSyncApp>>, ctx: egui::Context) {
         let handler: TrayCommandHandler = Arc::new(move |command| {
             let Some(app) = app.upgrade() else {
@@ -2438,7 +2447,9 @@ impl ArcTrackerSyncApp {
                 }
             }
             HubState::LauncherReady => {
-                if secondary_button(ui, &tr!("SyncApp.action.hideToTray")) {
+                if self.tray.is_some()
+                    && secondary_button(ui, &tr!("SyncApp.action.hideToTray"))
+                {
                     self.hide_to_tray(ctx);
                 }
             }
@@ -2452,7 +2463,9 @@ impl ArcTrackerSyncApp {
                 if primary_button(ui, &tr!("SyncApp.action.viewStash")) {
                     let _ = auth_bridge::open_browser(STASH_URL);
                 }
-                if secondary_button(ui, &tr!("SyncApp.action.hideToTray")) {
+                if self.tray.is_some()
+                    && secondary_button(ui, &tr!("SyncApp.action.hideToTray"))
+                {
                     self.hide_to_tray(ctx);
                 }
             }
