@@ -107,9 +107,7 @@ Npcap capture method uses Npcap's driver, installed separately by the user.
 
 Windows is the primary, prebuilt target. Linux is supported as a
 **build-from-source** option for running ARC Raiders through Proton — there is
-no Linux release binary, so you compile it yourself. The audience here is
-already comfortable in a terminal (you're running a Proton game), so this is a
-script, not an installer.
+no Linux release binary.
 
 Prerequisites:
 
