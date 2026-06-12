@@ -141,24 +141,63 @@ mod stub {
         }
     }
 
-    /// Re-launch the app through `pkexec` so a graphical sudo prompt grants the
-    /// capture capability for this run.
+    /// Grant the capture capability via a single graphical `pkexec` prompt, then
+    /// restart as the same user. We do NOT run the GUI itself under `pkexec`:
+    /// a root process loses access to the user's Wayland/X session (pkexec
+    /// scrubs the environment), so the window would never appear. Instead we
+    /// `setcap cap_net_raw+ep` the binary file — that capability is picked up on
+    /// the next `exec`, so we re-launch as the normal user and exit this copy.
     pub fn relaunch_elevated() -> Result<()> {
         if is_elevated() {
             return Ok(());
         }
         let exe = std::env::current_exe()?;
+        let setcap = find_setcap()
+            .ok_or_else(|| anyhow!("setcap not found — install libcap (it provides setcap)"))?;
+
         let status = std::process::Command::new("pkexec")
-            .arg(exe)
+            .arg(setcap)
+            .arg("cap_net_raw+ep")
+            .arg(&exe)
             .status()
             .map_err(|error| {
-                anyhow!("could not run pkexec (install polkit, or run the app with sudo): {error}")
+                anyhow!("could not run pkexec (install polkit, or run `sudo setcap cap_net_raw+ep {}`): {error}", exe.display())
             })?;
-        if status.success() {
-            // The elevated copy now owns the session; exit this unprivileged one.
-            std::process::exit(0);
+        if !status.success() {
+            // Non-zero also covers the user cancelling the password dialog.
+            return Err(anyhow!(
+                "granting the capture capability was cancelled or failed"
+            ));
         }
-        Err(anyhow!("pkexec did not grant elevation"))
+
+        // The file now carries CAP_NET_RAW; a fresh exec as this same user picks
+        // it up and keeps the user's display session.
+        std::process::Command::new(&exe)
+            .spawn()
+            .map_err(|error| anyhow!("restarting after granting capability: {error}"))?;
+        std::process::exit(0);
+    }
+
+    /// Locate the `setcap` binary. pkexec wants an absolute path, and `setcap`
+    /// lives in different places across distros (usr-merged Arch vs split /sbin).
+    fn find_setcap() -> Option<std::path::PathBuf> {
+        let candidates = [
+            "/usr/sbin/setcap",
+            "/sbin/setcap",
+            "/usr/bin/setcap",
+            "/bin/setcap",
+        ];
+        candidates
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|path| path.exists())
+            .or_else(|| {
+                std::env::var_os("PATH").and_then(|paths| {
+                    std::env::split_paths(&paths)
+                        .map(|dir| dir.join("setcap"))
+                        .find(|path| path.exists())
+                })
+            })
     }
 }
 
