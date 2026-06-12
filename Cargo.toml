@@ -1,6 +1,6 @@
 [package]
 name = "arctracker-sync"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
 description = "Windows desktop helper that syncs your ARC Raiders inventory to ARCTracker."
@@ -28,7 +28,7 @@ getrandom = "0.2"
 hex = "0.4"
 pcapsql-core = { path = "vendor/pcapsql-core", default-features = false }
 rfd = "0.15"
-rust-i18n = "3"
+rust-i18n = "4"
 self-replace = "1.5"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

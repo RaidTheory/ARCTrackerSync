@@ -1,4 +1,28 @@
-//! Types the [`crate::rawsock`] backend produces for `capture.rs` to consume.
+//! Types shared by the capture backends ([`crate::rawsock`] and
+//! [`crate::npcap`]) and consumed by `capture.rs`.
+
+use serde::{Deserialize, Serialize};
+
+/// Which packet-capture backend drives the live capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CaptureMethod {
+    /// Windows raw sockets (`SIO_RCVALL`). Built in, nothing extra to install.
+    #[default]
+    RawSocket,
+    /// Npcap (`wpcap.dll`), installed separately by the user from npcap.com.
+    Npcap,
+}
+
+impl CaptureMethod {
+    /// English label for diagnostics and activity-log status lines (those are
+    /// intentionally not localized).
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptureMethod::RawSocket => "raw sockets",
+            CaptureMethod::Npcap => "Npcap",
+        }
+    }
+}
 
 /// A capture-able network interface, as shown in the adapter picker.
 #[derive(Debug, Clone, Default)]

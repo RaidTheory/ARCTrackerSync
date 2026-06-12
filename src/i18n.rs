@@ -238,5 +238,14 @@ mod tests {
             ),
             "Signed in as Matt"
         );
+        // The capture-method settings keys must resolve to real text.
+        assert_eq!(
+            __translate("SyncApp.settings.captureMethod", &[]),
+            "Capture method"
+        );
+        assert_ne!(
+            __translate("SyncApp.state.needsAttention.npcapBody", &[]),
+            "SyncApp.state.needsAttention.npcapBody"
+        );
     }
 }

@@ -60,9 +60,21 @@ ARCTracker sign-in is kept in Windows Credential Manager.
 
 To notice your game account connecting, ARCTracker Sync watches your own
 computer's network traffic using Windows raw sockets, which Windows only allows
-with Administrator rights. There's no kernel driver, bundled network library, or
-extra capture tool to install — and it only ever looks at traffic on your own
-machine.
+with Administrator rights. By default there's no kernel driver, bundled network
+library, or extra capture tool to install — and it only ever looks at traffic on
+your own machine.
+
+### Optional: Npcap capture
+
+Some antivirus products (Avast Web Shield, for example) interfere with
+raw-socket capture. If sync won't connect on your machine, Settings → Network
+lets you switch the capture method to **Npcap**, a separately installed
+packet-capture driver from <https://npcap.com>. ARCTracker Sync never bundles,
+downloads, or installs Npcap — its license forbids redistribution — so if you
+select Npcap without installing it, the app tells you and links to npcap.com.
+With Npcap selected, the app loads Npcap's `wpcap.dll` at runtime and captures
+through Npcap's kernel driver instead of raw sockets. It still only looks at
+traffic on your own machine, and Administrator is still required.
 
 ---
 
@@ -85,7 +97,8 @@ cargo run
 
 The app ships a manifest that requests elevation, so it runs as Administrator
 (required for the raw-socket capture described above). No kernel driver or
-external tooling is needed.
+external tooling is needed for the default raw-socket capture; the optional
+Npcap capture method uses Npcap's driver, installed separately by the user.
 
 ## Contributing
 

@@ -19,6 +19,8 @@ use pcapsql_core::stream::{
 use pcapsql_core::tls::KeyLog as SyncKeyData;
 use sha2::{Digest, Sha256};
 
+use crate::capture_backend::{CaptureMethod, Packet};
+use crate::npcap::Npcap;
 use crate::packet::{datalink_name, parse_tcp_segment, CapturedSegment};
 use crate::rawsock::RawSock;
 use crate::token::{self, RawTokenHit, TokenObservation};
@@ -147,13 +149,69 @@ pub fn list_interfaces() -> Result<Vec<InterfaceInfo>> {
         .collect())
 }
 
-pub fn start_capture(interface_name: String, sync_key_path: PathBuf) -> CaptureHandle {
+/// The open capture handle for whichever backend the user selected. Both
+/// backends expose the same pcap-shaped surface, so `capture_loop` is
+/// backend-agnostic past this point.
+enum LiveCapture {
+    Raw(crate::rawsock::Capture),
+    Npcap(crate::npcap::Capture),
+}
+
+impl LiveCapture {
+    fn next_packet(&mut self) -> Result<Option<Packet>> {
+        match self {
+            LiveCapture::Raw(capture) => capture.next_packet(),
+            LiveCapture::Npcap(capture) => capture.next_packet(),
+        }
+    }
+
+    fn datalink(&self) -> Result<i32> {
+        match self {
+            LiveCapture::Raw(capture) => capture.datalink(),
+            LiveCapture::Npcap(capture) => capture.datalink(),
+        }
+    }
+
+    fn set_filter(&mut self, expression: &str) -> Result<()> {
+        match self {
+            LiveCapture::Raw(capture) => capture.set_filter(expression),
+            LiveCapture::Npcap(capture) => capture.set_filter(expression),
+        }
+    }
+}
+
+fn open_capture(method: CaptureMethod, interface_name: &str) -> Result<LiveCapture> {
+    match method {
+        CaptureMethod::RawSocket => Ok(LiveCapture::Raw(
+            RawSock::load()?
+                .open_live(interface_name)
+                .with_context(|| format!("opening raw-socket capture on {interface_name}"))?,
+        )),
+        CaptureMethod::Npcap => Ok(LiveCapture::Npcap(
+            Npcap::load()?
+                .open_adapter(interface_name)
+                .with_context(|| format!("opening Npcap capture on {interface_name}"))?,
+        )),
+    }
+}
+
+pub fn start_capture(
+    method: CaptureMethod,
+    interface_name: String,
+    sync_key_path: PathBuf,
+) -> CaptureHandle {
     let (tx, rx) = unbounded();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
 
     let worker = thread::spawn(move || {
-        if let Err(error) = capture_loop(interface_name, sync_key_path, thread_stop, tx.clone()) {
+        if let Err(error) = capture_loop(
+            method,
+            interface_name,
+            sync_key_path,
+            thread_stop,
+            tx.clone(),
+        ) {
             let _ = tx.send(CaptureEvent::Error(format!("{error:#}")));
         }
         let _ = tx.send(CaptureEvent::Stopped);
@@ -167,6 +225,7 @@ pub fn start_capture(interface_name: String, sync_key_path: PathBuf) -> CaptureH
 }
 
 fn capture_loop(
+    method: CaptureMethod,
     interface_name: String,
     sync_key_path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -195,18 +254,20 @@ fn capture_loop(
     let mut manager = build_manager(sync_keys);
 
     let _ = tx.send(CaptureEvent::Status(format!(
-        "Opening capture interface {interface_name}"
+        "Opening capture interface {interface_name} via {}",
+        method.label()
     )));
     // Raw-socket inbound capture is blocked by the Windows Firewall; add an
-    // inbound allow rule for our exe first (best-effort).
-    if let Err(error) = crate::firewall::ensure_capture_allowed() {
-        let _ = tx.send(CaptureEvent::Status(format!(
-            "Could not add firewall allowance (inbound may be blocked): {error}"
-        )));
+    // inbound allow rule for our exe first (best-effort). Npcap captures at
+    // the NDIS layer below the firewall, so no rule is needed there.
+    if method == CaptureMethod::RawSocket {
+        if let Err(error) = crate::firewall::ensure_capture_allowed() {
+            let _ = tx.send(CaptureEvent::Status(format!(
+                "Could not add firewall allowance (inbound may be blocked): {error}"
+            )));
+        }
     }
-    let mut capture: crate::rawsock::Capture = RawSock::load()?
-        .open_live(&interface_name)
-        .with_context(|| format!("opening raw-socket capture on {interface_name}"))?;
+    let mut capture = open_capture(method, &interface_name)?;
     capture
         .set_filter(LIVE_BPF_FILTER)
         .with_context(|| format!("installing capture filter {LIVE_BPF_FILTER:?}"))?;
