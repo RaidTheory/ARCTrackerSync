@@ -179,13 +179,13 @@ pub fn apply_arc_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = arc_bg();
     visuals.window_fill = arc_card();
-    visuals.window_stroke = Stroke::new(1.0, arc_border());
+    visuals.window_stroke = Stroke::new(1.0_f32, arc_border());
     visuals.window_corner_radius = CornerRadius::same(RADIUS_CARD);
     visuals.extreme_bg_color = arc_input();
     visuals.faint_bg_color = arc_muted();
     visuals.hyperlink_color = arc_primary();
     visuals.selection.bg_fill = arc_primary();
-    visuals.selection.stroke = Stroke::new(1.0, arc_primary_foreground());
+    visuals.selection.stroke = Stroke::new(1.0_f32, arc_primary_foreground());
 
     for state in [
         &mut visuals.widgets.inactive,
@@ -199,18 +199,18 @@ pub fn apply_arc_theme(ctx: &egui::Context) {
 
     visuals.widgets.inactive.bg_fill = arc_input();
     visuals.widgets.inactive.weak_bg_fill = arc_input();
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, arc_border());
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, arc_foreground());
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, arc_border());
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, arc_foreground());
     visuals.widgets.hovered.bg_fill = arc_muted();
     visuals.widgets.hovered.weak_bg_fill = arc_muted();
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, arc_border_strong());
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, arc_foreground());
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, arc_border_strong());
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, arc_foreground());
     // Pressed/active state stays subtle (a faint surface) rather than flashing
     // the gold accent, which inverted text and made controls hard to read.
     visuals.widgets.active.bg_fill = arc_muted();
     visuals.widgets.active.weak_bg_fill = arc_muted();
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, arc_border_strong());
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, arc_foreground());
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, arc_border_strong());
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, arc_foreground());
 
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals;

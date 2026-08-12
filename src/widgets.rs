@@ -51,7 +51,7 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> bool {
 pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> bool {
     let button = egui::Button::new(RichText::new(label).color(arc_foreground()))
         .fill(arc_input())
-        .stroke(Stroke::new(1.0, arc_border()))
+        .stroke(Stroke::new(1.0_f32, arc_border()))
         .corner_radius(CornerRadius::same(RADIUS_CONTROL));
     ui.add(button)
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -72,7 +72,7 @@ pub fn launcher_segment(ui: &mut egui::Ui, label: &str, selected: bool) -> bool 
         (
             arc_input(),
             arc_foreground(),
-            Stroke::new(1.0, arc_border()),
+            Stroke::new(1.0_f32, arc_border()),
         )
     };
     let button = egui::Button::new(RichText::new(label).size(TEXT_CAPTION).color(text))
@@ -89,7 +89,7 @@ pub fn launcher_segment(ui: &mut egui::Ui, label: &str, selected: bool) -> bool 
 pub fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     Frame::NONE
         .fill(arc_card())
-        .stroke(Stroke::new(1.0, arc_border()))
+        .stroke(Stroke::new(1.0_f32, arc_border()))
         .corner_radius(CornerRadius::same(RADIUS_CARD))
         .inner_margin(Margin::same(16))
         .show(ui, |ui| {
@@ -108,7 +108,7 @@ pub fn tone_card<R>(
 ) -> R {
     Frame::NONE
         .fill(tone.linear_multiply(TONE_FILL_OPACITY))
-        .stroke(Stroke::new(1.0, tone.linear_multiply(TONE_STROKE_OPACITY)))
+        .stroke(Stroke::new(1.0_f32, tone.linear_multiply(TONE_STROKE_OPACITY)))
         .corner_radius(CornerRadius::same(RADIUS_TILE))
         .inner_margin(Margin::symmetric(14, 12))
         .show(ui, |ui| {
@@ -162,7 +162,7 @@ pub fn hairline(ui: &mut egui::Ui) {
     ui.painter().hline(
         rect.x_range(),
         rect.center().y,
-        Stroke::new(1.0, arc_border_soft()),
+        Stroke::new(1.0_f32, arc_border_soft()),
     );
 }
 
@@ -183,7 +183,7 @@ fn paint_pill_bg(ui: &egui::Ui, rect: Rect, color: Color32) {
     painter.rect_stroke(
         rect,
         CornerRadius::same(RADIUS_PILL),
-        Stroke::new(1.0, color.linear_multiply(PILL_STROKE_OPACITY)),
+        Stroke::new(1.0_f32, color.linear_multiply(PILL_STROKE_OPACITY)),
         StrokeKind::Inside,
     );
 }
@@ -268,7 +268,7 @@ pub fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> bool {
         painter.rect_stroke(
             rect,
             CornerRadius::same(RADIUS_PILL),
-            Stroke::new(1.0, arc_border_strong()),
+            Stroke::new(1.0_f32, arc_border_strong()),
             StrokeKind::Inside,
         );
     }
@@ -314,7 +314,7 @@ pub fn vertical_stepper(ui: &mut egui::Ui, nodes: &[StepperNode<'_>], tone: Colo
             };
             let top = pos2(center.x, center.y + node_r + 4.0);
             let bottom = pos2(center.x, center.y + STEP_ROW_HEIGHT - node_r - 4.0);
-            painter.line_segment([top, bottom], Stroke::new(2.0, color));
+            painter.line_segment([top, bottom], Stroke::new(2.0_f32, color));
         }
 
         match node.state {
@@ -329,11 +329,11 @@ pub fn vertical_stepper(ui: &mut egui::Ui, nodes: &[StepperNode<'_>], tone: Colo
                     0.18
                 };
                 painter.circle_filled(center, node_r + 6.0, tone.linear_multiply(halo));
-                painter.circle_stroke(center, node_r, Stroke::new(2.0, tone));
+                painter.circle_stroke(center, node_r, Stroke::new(2.0_f32, tone));
                 painter.circle_filled(center, 4.5, tone);
             }
             StageState::Pending => {
-                painter.circle_stroke(center, node_r, Stroke::new(1.5, arc_border_strong()));
+                painter.circle_stroke(center, node_r, Stroke::new(1.5_f32, arc_border_strong()));
                 painter.text(
                     center,
                     Align2::CENTER_CENTER,
@@ -423,7 +423,7 @@ pub fn window_button(ui: &mut egui::Ui, kind: WindowButton) -> bool {
         arc_muted_text()
     };
     let c = rect.center();
-    let stroke = Stroke::new(1.4, fg);
+    let stroke = Stroke::new(1.4_f32, fg);
     match kind {
         WindowButton::Minimize => {
             painter.line_segment([c + vec2(-5.0, 0.0), c + vec2(5.0, 0.0)], stroke);
@@ -550,7 +550,7 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 }
 
 fn draw_check(painter: &egui::Painter, center: Pos2, color: Color32) {
-    let stroke = Stroke::new(2.0, color);
+    let stroke = Stroke::new(2.0_f32, color);
     let p1 = center + vec2(-4.5, 0.0);
     let p2 = center + vec2(-1.0, 3.5);
     let p3 = center + vec2(5.0, -3.5);
@@ -591,7 +591,7 @@ fn arrowhead(painter: &egui::Painter, points: &[Pos2], color: Color32) {
 }
 
 fn draw_phase_icon(painter: &egui::Painter, center: Pos2, color: Color32, phase: usize) {
-    let stroke = Stroke::new(2.0, color);
+    let stroke = Stroke::new(2.0_f32, color);
     match phase {
         0 => {
             // Account — head + shoulders.
@@ -682,7 +682,7 @@ fn draw_gear(painter: &egui::Painter, center: Pos2, color: Color32, size: f32) {
     // The "spoke" settings glyph: a hub ring with eight evenly-spaced spokes.
     // Round caps on both ends make every spoke look identical so the icon reads
     // as symmetric and round.
-    let stroke = Stroke::new(1.6, color);
+    let stroke = Stroke::new(1.6_f32, color);
     let cap = stroke.width / 2.0;
     let hub = size * 0.20;
     let r_in = size * 0.31;
@@ -712,7 +712,7 @@ pub fn back_button(ui: &mut egui::Ui) -> bool {
     } else {
         arc_muted_text()
     };
-    let stroke = Stroke::new(1.7, fg);
+    let stroke = Stroke::new(1.7_f32, fg);
     let c = rect.center();
     painter.line_segment([c + vec2(7.0, 0.0), c + vec2(-7.0, 0.0)], stroke);
     painter.line_segment([c + vec2(-7.0, 0.0), c + vec2(-2.0, -5.0)], stroke);
@@ -726,7 +726,7 @@ pub fn back_button(ui: &mut egui::Ui) -> bool {
 pub fn secondary_button_full(ui: &mut egui::Ui, label: &str) -> bool {
     let button = egui::Button::new(RichText::new(label).color(arc_foreground()))
         .fill(arc_input())
-        .stroke(Stroke::new(1.0, arc_border_strong()))
+        .stroke(Stroke::new(1.0_f32, arc_border_strong()))
         .corner_radius(CornerRadius::same(RADIUS_CONTROL));
     ui.add_sized(vec2(ui.available_width(), 38.0), button)
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -752,11 +752,11 @@ pub fn refresh_badge(ui: &mut egui::Ui) {
     painter.rect_stroke(
         rect,
         CornerRadius::same(11),
-        Stroke::new(1.0, accent.linear_multiply(0.40)),
+        Stroke::new(1.0_f32, accent.linear_multiply(0.40)),
         StrokeKind::Inside,
     );
     let arc = arc_points(rect.center(), 6.5, 130.0, 400.0, 28);
-    painter.add(Shape::line(arc.clone(), Stroke::new(2.0, accent)));
+    painter.add(Shape::line(arc.clone(), Stroke::new(2.0_f32, accent)));
     arrowhead(painter, &arc, accent);
 }
 
@@ -795,7 +795,7 @@ pub fn arc_modal(id: &str) -> egui::Modal {
         .frame(
             Frame::NONE
                 .fill(arc_card())
-                .stroke(Stroke::new(1.0, arc_border()))
+                .stroke(Stroke::new(1.0_f32, arc_border()))
                 .corner_radius(CornerRadius::same(RADIUS_CARD))
                 .inner_margin(Margin::same(26)),
         )

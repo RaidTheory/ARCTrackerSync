@@ -2082,7 +2082,7 @@ impl ArcTrackerSyncApp {
         ui.painter().vline(
             divider_x,
             (inner.top() + 6.0)..=(inner.bottom() - 6.0),
-            Stroke::new(1.0, arc_border_soft()),
+            Stroke::new(1.0_f32, arc_border_soft()),
         );
 
         // Left rail: the four-phase stepper. progress_stages() supplies each
@@ -2403,7 +2403,7 @@ impl ArcTrackerSyncApp {
         ui.painter().hline(
             rect.x_range(),
             rect.bottom() - 0.5,
-            Stroke::new(1.0, arc_border_soft()),
+            Stroke::new(1.0_f32, arc_border_soft()),
         );
 
         let drag = ui.interact(
@@ -2629,7 +2629,7 @@ impl ArcTrackerSyncApp {
         ui.painter().hline(
             rect.x_range(),
             rect.top() + 0.5,
-            Stroke::new(1.0, arc_border_soft()),
+            Stroke::new(1.0_f32, arc_border_soft()),
         );
 
         let (dot_color, job) = self.footer_identity();
@@ -3132,7 +3132,7 @@ impl ArcTrackerSyncApp {
     fn render_activity_log(&self, ui: &mut egui::Ui) {
         Frame::NONE
             .fill(arc_input())
-            .stroke(Stroke::new(1.0, arc_border()))
+            .stroke(Stroke::new(1.0_f32, arc_border()))
             .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
@@ -3190,7 +3190,7 @@ impl ArcTrackerSyncApp {
         let window_r = if maximized { 0 } else { theme::RADIUS_WINDOW };
         let window_frame = Frame::NONE
             .fill(arc_bg())
-            .stroke(Stroke::new(1.0, arc_border()))
+            .stroke(Stroke::new(1.0_f32, arc_border()))
             .corner_radius(CornerRadius::same(window_r));
 
         let state = self.hub_state();
