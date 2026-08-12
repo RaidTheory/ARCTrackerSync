@@ -48,6 +48,9 @@ type RefreshResult = Result<String, SubmitError>;
 /// launcher runs as `PioneerGame.exe`; once it hands off, the running game is
 /// `PioneerGame-e.exe` (EAC) or `PioneerGame-d.exe`.
 const GAME_PROCESS_NAMES: &[&str] = &["PioneerGame.exe", "PioneerGame-e.exe", "PioneerGame-d.exe"];
+/// Room left for a settings row's label and sub-label when the control next to
+/// it wants the rest of the width.
+const LABEL_COLUMN_WIDTH: f32 = 220.0;
 const HELP_URL: &str = "https://arctracker.io/help/sync";
 /// Where a synced user goes to view their inventory on the web app.
 const STASH_URL: &str = "https://arctracker.io/stash";
@@ -1347,20 +1350,40 @@ impl ArcTrackerSyncApp {
     }
 
     fn browse_game_executable(&mut self) {
+        // Reached from the hub's "choose game" button as well as Settings. The
+        // picker would return None here rather than fail, so without this the
+        // button looks broken.
+        if !elevation::portal_dialogs_available() {
+            self.push_message(
+                "File dialogs cannot open while this binary carries CAP_NET_RAW \
+                 (the desktop portal cannot identify the process). Type the game \
+                 path under Settings instead."
+                    .to_string(),
+            );
+            return;
+        }
+
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Choose ARC Raiders")
             .add_filter("Game file", &["exe"])
             .pick_file()
         {
             self.game_path_text = path.display().to_string();
-            self.config.game_executable_path = Some(path.clone());
-            if self.config.platform == LauncherPlatform::Auto {
-                self.config.platform =
-                    launch::resolve_platform(LauncherPlatform::Auto, Some(&path));
-            }
-            self.save_config();
-            self.refresh_launcher_readiness();
+            self.apply_game_path();
         }
+    }
+
+    /// Adopt whatever `game_path_text` currently holds, whether it arrived from
+    /// the file picker or was typed in because the picker is unavailable.
+    fn apply_game_path(&mut self) {
+        let path = self.selected_game_path();
+        self.config.game_executable_path = path.clone();
+        if self.config.platform == LauncherPlatform::Auto {
+            self.config.platform =
+                launch::resolve_platform(LauncherPlatform::Auto, path.as_deref());
+        }
+        self.save_config();
+        self.refresh_launcher_readiness();
     }
 
     /// Switching to Epic with no game path set auto-fills it from the Epic
@@ -2845,12 +2868,31 @@ impl ArcTrackerSyncApp {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| tr!("SyncApp.settings.autoDetected"));
             settings_row(ui, &tr!("SyncApp.settings.arcLocation"), &location, |ui| {
-                if ui
-                    .button(tr!("SyncApp.settings.change"))
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    self.browse_game_executable();
+                // A file picker cannot open while this process holds a permitted
+                // capability, so offer a text field there rather than a button
+                // that would silently do nothing.
+                if elevation::portal_dialogs_available() {
+                    if ui
+                        .button(tr!("SyncApp.settings.change"))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.browse_game_executable();
+                    }
+                } else {
+                    // Take the row's width apart from a reserve for the label
+                    // column, rather than a fixed size: game paths run past 70
+                    // characters, and the row lays this control out first, so
+                    // whatever is claimed here is taken from the label.
+                    let width = (ui.available_width() - LABEL_COLUMN_WIDTH)
+                        .max(theme::SPACE_XL * 8.0);
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut self.game_path_text)
+                            .desired_width(width))
+                        .changed()
+                    {
+                        self.apply_game_path();
+                    }
                 }
             });
         });

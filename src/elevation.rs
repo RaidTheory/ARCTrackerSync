@@ -8,6 +8,49 @@ pub use imp::{is_elevated, relaunch_elevated};
 #[cfg(not(windows))]
 pub use stub::{is_elevated, relaunch_elevated};
 
+/// Whether desktop-portal dialogs — the file picker, in practice — can work in
+/// this process.
+///
+/// `xdg-desktop-portal` identifies the process asking for a dialog by opening
+/// `/proc/<pid>/root`. The kernel gates that behind `ptrace_may_access`, which
+/// refuses unless the reader holds a superset of the target's *permitted*
+/// capabilities. The portal holds none, so once this binary carries
+/// `CAP_NET_RAW` from `setcap` it can never be identified, and every request
+/// comes back as:
+///
+/// ```text
+/// Portal operation not allowed: Unable to open /proc/<pid>/root
+/// ```
+///
+/// There is no way to satisfy both: capture needs the capability for as long as
+/// the app can reopen a socket, and a permitted capability can only be dropped,
+/// never regained. So the picker is reported as unavailable and the path is
+/// typed instead — better than a button that silently does nothing.
+///
+/// Elevation on Windows works through the process token, not file
+/// capabilities, so dialogs are unaffected there.
+pub fn portal_dialogs_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Any permitted capability blocks the portal, not just CAP_NET_RAW; a
+        // zero mask is the only case that lets it identify us. Unreadable or
+        // unparseable status means we are not in the setcap situation this
+        // guards against, so keep the picker.
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return true;
+        };
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapPrm:"))
+            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+            .is_none_or(|permitted| permitted == 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::os::windows::ffi::OsStrExt;
