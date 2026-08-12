@@ -48,14 +48,15 @@ pub fn native_name(locale: &str) -> &'static str {
 /// (2) the Windows UI language mapped to the nearest supported locale,
 /// otherwise (3) English. Returns one of [`UI_LOCALES`].
 pub fn resolve_locale(preferred: Option<&str>) -> &'static str {
-    if let Some(preferred) = preferred {
-        if let Some(matched) = match_supported(preferred) {
-            return matched;
-        }
-    }
+    resolve_locale_from(preferred, system_ui_language().as_deref())
+}
 
-    if let Some(system) = system_ui_language() {
-        if let Some(matched) = match_supported(&system) {
+/// [`resolve_locale`] with the system UI language supplied by the caller, so
+/// the fallback chain can be tested without depending on the locale of the
+/// machine running the tests.
+fn resolve_locale_from(preferred: Option<&str>, system: Option<&str>) -> &'static str {
+    for candidate in [preferred, system].into_iter().flatten() {
+        if let Some(matched) = match_supported(candidate) {
             return matched;
         }
     }
@@ -209,8 +210,19 @@ mod tests {
 
     #[test]
     fn unknown_tag_resolves_to_english() {
-        assert_eq!(resolve_locale(Some("xx")), "en");
-        assert_eq!(resolve_locale(Some("de")), "de");
+        // Exercised through `resolve_locale_from` with an explicit system
+        // language: `resolve_locale` reads the machine's UI language, so an
+        // unknown preferred tag falls through to it and this test would pass
+        // on an English system while failing on every other one.
+        assert_eq!(resolve_locale_from(Some("xx"), None), "en");
+        assert_eq!(resolve_locale_from(Some("de"), None), "de");
+    }
+
+    #[test]
+    fn system_language_is_the_fallback_for_an_unknown_preference() {
+        assert_eq!(resolve_locale_from(Some("xx"), Some("fr-CA")), "fr");
+        assert_eq!(resolve_locale_from(None, Some("de")), "de");
+        assert_eq!(resolve_locale_from(Some("xx"), Some("xx")), "en");
     }
 
     #[test]
