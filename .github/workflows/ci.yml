@@ -54,13 +54,6 @@ jobs:
         with:
           components: clippy
 
-      # eframe/tray pull in GTK, libxdo and the Ayatana app-indicator at build
-      # time; the runner image doesn't ship their -dev packages.
-      - name: Install system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev pkg-config
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 

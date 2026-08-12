@@ -112,10 +112,10 @@ no Linux release binary.
 Prerequisites:
 
 - A stable Rust toolchain (install via [rustup](https://rustup.rs/)).
-- The GUI's system libraries: GTK 3, libxdo, and the Ayatana app-indicator
-  (`libgtk-3-dev`, `libxdo-dev`, `libayatana-appindicator3-dev` on Debian/Ubuntu;
-  the equivalents on your distro).
 - ARC Raiders on **Steam** (the Epic launcher isn't supported on Linux).
+
+No `-dev` packages are needed: the tray is Windows-only, and the file dialogs
+go through the XDG desktop portal over D-Bus rather than linking GTK.
 
 From the repository root:
 
