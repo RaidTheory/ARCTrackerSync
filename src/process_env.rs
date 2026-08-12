@@ -48,13 +48,34 @@ mod linux_process_env {
 
     use super::LauncherProcess;
 
-    /// Match a Windows-style launcher name (`steam.exe`) against a Linux process
-    /// comm (`steam`): case-insensitive, with a trailing `.exe` ignored on the
-    /// query side. So the cross-platform callers in `launch.rs` keep working
-    /// unchanged.
-    fn names_match(query: &str, comm: &str) -> bool {
-        let query = query.strip_suffix(".exe").unwrap_or(query);
-        comm.eq_ignore_ascii_case(query)
+    /// Match a Windows-style name (`steam.exe`) against whatever this process
+    /// reports, case-insensitively and ignoring a trailing `.exe` on either
+    /// side. The suffix is dropped from both because native Linux Steam reports
+    /// `steam` while the copy Proton runs under Wine reports `steam.exe`, and
+    /// the cross-platform callers in `launch.rs` pass the Windows name for both.
+    fn names_match(query: &str, candidate: &str) -> bool {
+        // Lowercased before stripping: `strip_suffix` is case-sensitive, so a
+        // `.EXE` spelling would otherwise keep its suffix and never match.
+        let strip = |name: &str| {
+            let lower = name.to_ascii_lowercase();
+            lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+        };
+        strip(query) == strip(candidate)
+    }
+
+    /// Final component of a path that may use either separator. Wine reports
+    /// Windows paths (`S:\common\Arc Raiders\...\PioneerGame.exe`) in the
+    /// command line of a Linux process, so `Path::file_name` is no help.
+    fn windows_basename(path: &str) -> &str {
+        path.rsplit(['\\', '/']).next().unwrap_or(path)
+    }
+
+    /// `argv[0]` of a process, which for a Wine program is the Windows path of
+    /// the executable it is running.
+    fn argv0(proc_dir: &std::path::Path) -> Option<String> {
+        let cmdline = std::fs::read(proc_dir.join("cmdline")).ok()?;
+        let first = cmdline.split(|&byte| byte == 0).next()?;
+        (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
     }
 
     pub fn find_processes(process_name: &str) -> Result<Vec<LauncherProcess>> {
@@ -78,7 +99,17 @@ mod linux_process_env {
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| names_match(process_name, n));
-            if !names_match(process_name, &comm) && !exe_matches {
+            // A Windows program under Wine matches on neither of the above:
+            // `exe` resolves to the Wine preloader, and `comm` holds whatever
+            // the program named its main thread (ARC Raiders reports
+            // `GameThread`) truncated to 15 bytes. Its command line still
+            // carries the real executable path.
+            let cmdline_matches = || {
+                argv0(&proc_dir).is_some_and(|argv0| {
+                    names_match(process_name, windows_basename(argv0.trim()))
+                })
+            };
+            if !names_match(process_name, &comm) && !exe_matches && !cmdline_matches() {
                 continue;
             }
             let parent_pid = read_ppid(&proc_dir).unwrap_or(0);
@@ -119,6 +150,35 @@ mod linux_process_env {
         let stat = std::fs::read_to_string(proc_dir.join("stat")).ok()?;
         let after_comm = stat.rsplit_once(')')?.1;
         after_comm.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn names_match_ignores_the_exe_suffix_on_either_side() {
+            // Native Steam reports `steam`; the copy Wine runs reports
+            // `steam.exe`. Callers pass the Windows name for both.
+            assert!(names_match("steam.exe", "steam"));
+            assert!(names_match("steam.exe", "steam.exe"));
+            assert!(names_match("steam", "steam.exe"));
+            assert!(names_match("STEAM.EXE", "steam"));
+            assert!(!names_match("steam.exe", "steamwebhelper"));
+        }
+
+        #[test]
+        fn windows_basename_splits_on_either_separator() {
+            assert_eq!(
+                windows_basename(r"S:\common\Arc Raiders\PioneerGame.exe"),
+                "PioneerGame.exe"
+            );
+            assert_eq!(
+                windows_basename("/home/user/.steam/steam/steam"),
+                "steam"
+            );
+            assert_eq!(windows_basename("PioneerGame.exe"), "PioneerGame.exe");
+        }
     }
 }
 
