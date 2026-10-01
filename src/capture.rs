@@ -19,8 +19,6 @@ use pcapsql_core::stream::{
 use pcapsql_core::tls::KeyLog as SyncKeyData;
 use sha2::{Digest, Sha256};
 
-use crate::capture_backend::{CaptureMethod, Packet};
-use crate::npcap::Npcap;
 use crate::packet::{datalink_name, parse_tcp_segment, CapturedSegment};
 use crate::rawsock::RawSock;
 use crate::token::{self, RawTokenHit, TokenObservation};
@@ -29,19 +27,11 @@ const MAX_RECENT_SEGMENTS: usize = 5_000;
 const MAX_RECENT_BYTES: usize = 24 * 1024 * 1024;
 const MAX_SYNC_KEY_TAIL_BYTES: u64 = 64 * 1024 * 1024;
 const LIVE_BPF_FILTER: &str = "tcp port 443";
-/// Token-observation dedup set cap; the whole set is cleared past this size so
-/// a long capture can't grow it unbounded. Clearing at worst re-emits an
-/// already-seen token, which the UI handles idempotently.
+/// Upper bound on the token-observation dedup set. Each entry is a small
+/// fingerprint string; we clear the whole set once it crosses this size so an
+/// unbounded capture session can't grow it without limit. Clearing only risks
+/// re-emitting an already-seen token, which the UI handles idempotently.
 const MAX_SEEN_FINGERPRINTS: usize = 4_096;
-
-/// Cap on per-hit "HTTP/1.1 debug" status events. The game bursts many API
-/// calls at launch; the stats counters keep tracking after the events stop.
-const MAX_HTTP_DEBUG_EVENTS: u64 = 5;
-
-/// Cap on "Sync key changed" status events. The game rewrites the keylog
-/// continuously during play, which would flood the 20-entry activity log;
-/// `stats.sync_key_reloads` keeps the running count.
-const MAX_SYNC_KEY_RELOAD_EVENTS: u64 = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct InterfaceInfo {
@@ -103,9 +93,11 @@ pub struct CaptureStats {
 }
 
 #[derive(Debug, Clone)]
-// CaptureStats (~560 bytes) trips clippy::large_enum_variant. Not boxed: the
-// channel carries a few low-frequency events per second and the UI consumes
-// the variant by value, so boxing would just add an allocation per update.
+// CaptureStats is ~560 bytes — far larger than the other variants
+// (clippy::large_enum_variant). We keep it inline rather than boxing: the
+// variant is consumed by value on the UI side (`self.stats = stats`), this
+// channel carries only a few low-frequency events per second, and boxing would
+// add an allocation per stats update for no measurable benefit at this rate.
 #[allow(clippy::large_enum_variant)]
 pub enum CaptureEvent {
     Status(String),
@@ -149,69 +141,13 @@ pub fn list_interfaces() -> Result<Vec<InterfaceInfo>> {
         .collect())
 }
 
-/// The open capture handle for whichever backend the user selected. Both
-/// backends expose the same pcap-shaped surface, so `capture_loop` is
-/// backend-agnostic past this point.
-enum LiveCapture {
-    Raw(crate::rawsock::Capture),
-    Npcap(crate::npcap::Capture),
-}
-
-impl LiveCapture {
-    fn next_packet(&mut self) -> Result<Option<Packet>> {
-        match self {
-            LiveCapture::Raw(capture) => capture.next_packet(),
-            LiveCapture::Npcap(capture) => capture.next_packet(),
-        }
-    }
-
-    fn datalink(&self) -> Result<i32> {
-        match self {
-            LiveCapture::Raw(capture) => capture.datalink(),
-            LiveCapture::Npcap(capture) => capture.datalink(),
-        }
-    }
-
-    fn set_filter(&mut self, expression: &str) -> Result<()> {
-        match self {
-            LiveCapture::Raw(capture) => capture.set_filter(expression),
-            LiveCapture::Npcap(capture) => capture.set_filter(expression),
-        }
-    }
-}
-
-fn open_capture(method: CaptureMethod, interface_name: &str) -> Result<LiveCapture> {
-    match method {
-        CaptureMethod::RawSocket => Ok(LiveCapture::Raw(
-            RawSock::load()?
-                .open_live(interface_name)
-                .with_context(|| format!("opening raw-socket capture on {interface_name}"))?,
-        )),
-        CaptureMethod::Npcap => Ok(LiveCapture::Npcap(
-            Npcap::load()?
-                .open_adapter(interface_name)
-                .with_context(|| format!("opening Npcap capture on {interface_name}"))?,
-        )),
-    }
-}
-
-pub fn start_capture(
-    method: CaptureMethod,
-    interface_name: String,
-    sync_key_path: PathBuf,
-) -> CaptureHandle {
+pub fn start_capture(interface_name: String, sync_key_path: PathBuf) -> CaptureHandle {
     let (tx, rx) = unbounded();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
 
     let worker = thread::spawn(move || {
-        if let Err(error) = capture_loop(
-            method,
-            interface_name,
-            sync_key_path,
-            thread_stop,
-            tx.clone(),
-        ) {
+        if let Err(error) = capture_loop(interface_name, sync_key_path, thread_stop, tx.clone()) {
             let _ = tx.send(CaptureEvent::Error(format!("{error:#}")));
         }
         let _ = tx.send(CaptureEvent::Stopped);
@@ -225,7 +161,6 @@ pub fn start_capture(
 }
 
 fn capture_loop(
-    method: CaptureMethod,
     interface_name: String,
     sync_key_path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -237,37 +172,28 @@ fn capture_loop(
         "Loading recent sync key tail from {}",
         sync_key_path.display()
     )));
-    let (sync_keys, load_warning) =
-        initial_sync_keys(&sync_key_path, &mut sync_key_signature, &mut stats);
-    match load_warning {
-        None => {
-            let _ = tx.send(CaptureEvent::Status(format!(
-                "Loaded sync key: {} entries across {} sessions",
-                stats.sync_key_entries, stats.sync_key_sessions
-            )));
-        }
-        Some(warning) => {
-            let _ = tx.send(CaptureEvent::Status(warning));
-        }
-    }
+    let sync_keys = load_sync_keys(&sync_key_path, &mut sync_key_signature, &mut stats)
+        .with_context(|| format!("loading sync key {}", sync_key_path.display()))?;
+    let _ = tx.send(CaptureEvent::Status(format!(
+        "Loaded sync key: {} entries across {} sessions",
+        stats.sync_key_entries, stats.sync_key_sessions
+    )));
     let _ = tx.send(CaptureEvent::Stats(stats.clone()));
     let mut manager = build_manager(sync_keys);
 
     let _ = tx.send(CaptureEvent::Status(format!(
-        "Opening capture interface {interface_name} via {}",
-        method.label()
+        "Opening capture interface {interface_name}"
     )));
     // Raw-socket inbound capture is blocked by the Windows Firewall; add an
-    // inbound allow rule for our exe first (best-effort). Npcap captures at
-    // the NDIS layer below the firewall, so no rule is needed there.
-    if method == CaptureMethod::RawSocket {
-        if let Err(error) = crate::firewall::ensure_capture_allowed() {
-            let _ = tx.send(CaptureEvent::Status(format!(
-                "Could not add firewall allowance (inbound may be blocked): {error}"
-            )));
-        }
+    // inbound allow rule for our exe first (best-effort).
+    if let Err(error) = crate::firewall::ensure_capture_allowed() {
+        let _ = tx.send(CaptureEvent::Status(format!(
+            "Could not add firewall allowance (inbound may be blocked): {error}"
+        )));
     }
-    let mut capture = open_capture(method, &interface_name)?;
+    let mut capture: crate::rawsock::Capture = RawSock::load()?
+        .open_live(&interface_name)
+        .with_context(|| format!("opening raw-socket capture on {interface_name}"))?;
     capture
         .set_filter(LIVE_BPF_FILTER)
         .with_context(|| format!("installing capture filter {LIVE_BPF_FILTER:?}"))?;
@@ -295,54 +221,22 @@ fn capture_loop(
     let mut last_sync_key_check = Instant::now();
     let mut last_stats_emit = Instant::now();
     let mut last_connection_cleanup = Instant::now();
-    // Throttle for the stream-buffer memory-limit warning (edge + 30 s cadence).
-    let mut last_mem_warn: Option<Instant> = None;
-    // Tracks the poll error state so a persistently unreadable sync key emits
-    // one status on the way in and one on recovery, not one per second.
-    let mut sync_key_poll_failing = false;
 
     while !stop.load(Ordering::Relaxed) {
         if last_sync_key_check.elapsed() >= Duration::from_secs(1) {
             last_sync_key_check = Instant::now();
-            // An unreadable sync key (deleted, locked, not created yet) must
-            // not kill the capture thread; keep polling until it comes back.
-            let changed = match sync_key_changed(&sync_key_path, sync_key_signature) {
-                Ok(changed) => {
-                    if sync_key_poll_failing {
-                        sync_key_poll_failing = false;
-                        let _ = tx.send(CaptureEvent::Status(
-                            "Sync key is readable again".to_string(),
-                        ));
-                    }
-                    changed
-                }
-                Err(error) => {
-                    if !sync_key_poll_failing {
-                        sync_key_poll_failing = true;
-                        let _ = tx.send(CaptureEvent::Status(format!(
-                            "Sync key check failed (will keep retrying): {error}"
-                        )));
-                    }
-                    false
-                }
-            };
-            if changed {
-                let announce_reload = stats.sync_key_reloads < MAX_SYNC_KEY_RELOAD_EVENTS;
-                if announce_reload {
-                    let _ = tx.send(CaptureEvent::Status(
-                        "Sync key changed, loading recent tail".to_string(),
-                    ));
-                }
+            if sync_key_changed(&sync_key_path, sync_key_signature)? {
+                let _ = tx.send(CaptureEvent::Status(
+                    "Sync key changed, loading recent tail".to_string(),
+                ));
                 match load_sync_keys(&sync_key_path, &mut sync_key_signature, &mut stats) {
                     Ok(sync_keys) => {
                         manager = build_manager(sync_keys);
                         stats.sync_key_reloads += 1;
-                        if announce_reload {
-                            let _ = tx.send(CaptureEvent::Status(format!(
-                                "Sync key changed, reprocessing {} recent TLS segments",
-                                recent.len()
-                            )));
-                        }
+                        let _ = tx.send(CaptureEvent::Status(format!(
+                            "Sync key changed, reprocessing {} recent TLS segments",
+                            recent.len()
+                        )));
                         reprocess_recent(
                             &mut manager,
                             &recent,
@@ -396,27 +290,12 @@ fn capture_loop(
 
         if last_connection_cleanup.elapsed() >= Duration::from_secs(30) {
             last_connection_cleanup = Instant::now();
-            // Drop matching embark_connections entries alongside the manager's
-            // eviction so the per-SNI map can't grow for the life of the capture.
+            // Evict timed-out TCP connections from the stream manager, and drop
+            // the matching entries from embark_connections so that per-SNI map
+            // can't grow for the life of the capture.
             for removed in manager.cleanup_timeout(now_micros()) {
                 embark_connections.remove(&removed.id);
             }
-        }
-
-        // Report the stream-buffer memory limit at most once per 30 s, and once
-        // when it clears — gameplay keeps many high-volume Embark TLS streams
-        // open, so a per-segment check would spam tens of thousands of lines.
-        let over_limit = manager.memory_limit_exceeded();
-        if over_limit && last_mem_warn.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
-            last_mem_warn = Some(Instant::now());
-            let _ = tx.send(CaptureEvent::Status(
-                "Stream memory limit exceeded; waiting for connection cleanup".to_string(),
-            ));
-        } else if !over_limit && last_mem_warn.is_some() {
-            last_mem_warn = None;
-            let _ = tx.send(CaptureEvent::Status(
-                "Stream memory back within limit".to_string(),
-            ));
         }
 
         if last_stats_emit.elapsed() >= Duration::from_millis(500) {
@@ -425,10 +304,11 @@ fn capture_loop(
         }
     }
 
-    // Don't delete the TLS sync-key file here: capture also stops on pause and
-    // settings/interface changes, and the file is only recreated by a
-    // user-initiated launcher prepare — deleting it would silently break
-    // resume. It is cleared once on real app shutdown (`ArcTrackerSyncApp::drop`).
+    // The app-owned TLS sync-key file is intentionally NOT deleted here. Capture also
+    // stops on pause and on settings/interface changes, and the file is only
+    // (re)created by a user-initiated launcher prepare — deleting it on every
+    // stop would silently break resume (capture can't restart without it). It is
+    // cleared once on real app shutdown instead (see `ArcTrackerSyncApp::drop`).
     let _ = tx.send(CaptureEvent::Status("Capture stopped".to_string()));
     Ok(())
 }
@@ -438,26 +318,6 @@ fn now_micros() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_micros() as i64)
         .unwrap_or(0)
-}
-
-/// Unreadable is non-fatal: transient AV/OneDrive locks, or the file not
-/// existing yet, must not kill the capture thread. On error capture starts
-/// with an empty keylog and a `None` signature, so the first successful 1s
-/// poll registers as changed, reloads, and reprocesses the recent-segment ring.
-fn initial_sync_keys(
-    path: &Path,
-    signature: &mut Option<SyncKeySignature>,
-    stats: &mut CaptureStats,
-) -> (SyncKeyData, Option<String>) {
-    match load_sync_keys(path, signature, stats) {
-        Ok(sync_keys) => (sync_keys, None),
-        Err(error) => (
-            SyncKeyData::new(),
-            Some(format!(
-                "Sync key is not readable yet (will keep retrying): {error:#}"
-            )),
-        ),
-    }
 }
 
 fn load_sync_keys(
@@ -578,6 +438,8 @@ fn process_segment(
                     stats.http1_embark_hosts += 1;
                     stats.http1_bearer_headers += 1;
                     let observation = TokenObservation::from_hit(hit);
+                    // Bound the dedup set so a long-lived session can't grow it
+                    // without limit; clearing at worst re-emits a seen token.
                     if seen_fingerprints.len() >= MAX_SEEN_FINGERPRINTS {
                         seen_fingerprints.clear();
                     }
@@ -594,9 +456,11 @@ fn process_segment(
         }
     }
 
-    // NB: the memory-limit warning is emitted from the main capture loop on an
-    // edge/time throttle, not here — this runs per-segment and would otherwise
-    // flood the log with tens of thousands of identical lines during gameplay.
+    if manager.memory_limit_exceeded() {
+        let _ = tx.send(CaptureEvent::Status(
+            "Stream memory limit exceeded; waiting for connection cleanup".to_string(),
+        ));
+    }
     let _ = tx.send(CaptureEvent::Stats(stats.clone()));
 }
 
@@ -709,11 +573,7 @@ fn update_observed_stats(
             if has_bearer {
                 stats.http1_bearer_headers += 1;
             }
-            // Emit only the first few hits as events; the counters and
-            // last_http1_* fields keep tracking everything.
-            if (has_embark_host || has_bearer)
-                && stats.http1_embark_hosts.max(stats.http1_bearer_headers) <= MAX_HTTP_DEBUG_EVENTS
-            {
+            if has_embark_host || has_bearer {
                 let host = field_str(message, "host").unwrap_or_else(|| "(no host)".to_string());
                 let method = field_str(message, "method").unwrap_or_default();
                 let path = field_str(message, "path").unwrap_or_default();
@@ -746,11 +606,16 @@ struct EmbarkTlsInfo {
 }
 
 fn is_embarkish_host(host: &str) -> bool {
-    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    normalized == "auth.embark.net"
-        || token::EMBARK_TOKEN_HOSTS
-            .iter()
-            .any(|known| normalized == *known)
+    matches!(
+        host.trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+            .as_str(),
+        "api-gateway.europe.es-pio.net"
+            | "auth.embark.net"
+            | "client2pubsub.europe.es-pio.net"
+            | "client2pubsub-ipv4.europe.es-pio.net"
+    )
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -857,11 +722,7 @@ impl EmbarkHttpParser {
         );
         fields.insert(
             "has_embark_host",
-            FieldValue::Bool(
-                token::EMBARK_TOKEN_HOSTS
-                    .iter()
-                    .any(|host| contains_bytes(data, host.as_bytes())),
-            ),
+            FieldValue::Bool(contains_bytes(data, token::EMBARK_HOST.as_bytes())),
         );
         fields.insert(
             "has_bearer_marker",
@@ -879,10 +740,11 @@ impl EmbarkHttpParser {
     }
 }
 
-/// Domain-separation constant: HTTP/1 reassembly buffers are keyed by
+/// Domain-separation constant for per-connection reassembly session tags. HTTP/1
+/// reassembly buffers are keyed by an opaque tag derived as
 /// `SHA-256(SESSION_DOMAIN || connection_id)` rather than the raw pcapsql-core
-/// connection id, so buffer state is namespaced to this scanner and never
-/// aliases the engine's internal connection numbering.
+/// connection id, so buffer state is namespaced to this scanner and never aliased
+/// to the engine's internal connection numbering across parser instances.
 const SESSION_DOMAIN: [u8; 64] = [
     0x78, 0xc0, 0xa9, 0x6a, 0x1b, 0xcc, 0x67, 0x2d, 0x74, 0x02, 0x6d, 0x24, 0x58, 0x47, 0xc1, 0x5d,
     0x62, 0x2b, 0x39, 0x52, 0xc6, 0xe6, 0xe3, 0x43, 0x2a, 0xf1, 0x2b, 0x2e, 0xd3, 0xd0, 0x69, 0x8d,
@@ -890,6 +752,7 @@ const SESSION_DOMAIN: [u8; 64] = [
     0xb0, 0xf7, 0xc6, 0xa5, 0xe5, 0xb2, 0x1c, 0xee, 0x5d, 0x96, 0xcd, 0x25, 0xb6, 0x59, 0x03, 0x08,
 ];
 
+/// Stable, opaque per-connection session tag used to key reassembly buffers.
 fn session_tag(connection_id: u64) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(SESSION_DOMAIN);
@@ -1021,73 +884,6 @@ mod tests {
     }
 
     #[test]
-    fn load_sync_keys_errors_when_path_is_a_directory() {
-        let temp_dir = unique_temp_dir("sync-key-dir");
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let mut signature = None;
-        let mut stats = CaptureStats::default();
-
-        let result = load_sync_keys(&temp_dir, &mut signature, &mut stats);
-
-        assert!(result.is_err(), "opening a directory as a keylog must fail");
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn initial_sync_keys_warns_and_starts_empty_when_unreadable() {
-        let temp_dir = unique_temp_dir("sync-key-unreadable");
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let mut signature = None;
-        let mut stats = CaptureStats::default();
-
-        let (keys, warning) = initial_sync_keys(&temp_dir, &mut signature, &mut stats);
-
-        assert!(keys.is_empty());
-        assert!(
-            signature.is_none(),
-            "no signature, so the first successful poll registers as changed and reloads"
-        );
-        let warning = warning.expect("warning for unreadable sync key");
-        assert!(
-            warning.contains("will keep retrying"),
-            "unexpected warning: {warning}"
-        );
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn initial_sync_keys_loads_existing_file_without_warning() {
-        let temp_dir = unique_temp_dir("sync-key-file");
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("sync-key.log");
-        let client_random = "ab".repeat(32);
-        let master_secret = "cd".repeat(48);
-        fs::write(
-            &path,
-            format!("CLIENT_RANDOM {client_random} {master_secret}\n"),
-        )
-        .expect("write keylog");
-        let mut signature = None;
-        let mut stats = CaptureStats::default();
-
-        let (keys, warning) = initial_sync_keys(&path, &mut signature, &mut stats);
-
-        assert_eq!(warning, None);
-        assert_eq!(keys.entry_count(), 1);
-        assert_eq!(stats.sync_key_entries, 1);
-        assert!(signature.is_some());
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        std::env::temp_dir().join(format!("arctracker-sync-capture-{label}-{nanos}"))
-    }
-
-    #[test]
     fn embark_http_parser_reassembles_split_http1_token_request() {
         let parser = EmbarkHttpParser::new();
         let context = stream_context(42, Direction::ToServer);
@@ -1178,34 +974,6 @@ mod tests {
                     && message.contains("api-gateway.europe.es-pio.net")
                     && message.contains("abc123")
         )));
-    }
-
-    #[test]
-    fn http_debug_status_events_are_capped() {
-        let (tx, rx) = unbounded();
-        let mut stats = CaptureStats::default();
-        let mut embark_connections = HashMap::new();
-
-        for _ in 0..20 {
-            let mut fields = HashMap::new();
-            insert_str(&mut fields, "host", token::EMBARK_HOST);
-            insert_str(&mut fields, "method", "POST");
-            insert_str(&mut fields, "path", "/v1/x");
-            fields.insert("has_embark_host", FieldValue::Bool(true));
-            fields.insert("has_bearer", FieldValue::Bool(true));
-            let message = parsed_message("embark_http_observation", 7, Direction::ToServer, fields);
-            update_observed_stats(&mut stats, &message, &tx, &mut embark_connections);
-        }
-
-        // Stats keep counting, but the per-hit status events stop after the cap
-        // so a long session can't flood the 20-entry activity log.
-        assert_eq!(stats.http1_candidates, 20);
-        assert_eq!(stats.http1_embark_hosts, 20);
-        let statuses = rx
-            .try_iter()
-            .filter(|event| matches!(event, CaptureEvent::Status(_)))
-            .count();
-        assert_eq!(statuses, MAX_HTTP_DEBUG_EVENTS as usize);
     }
 
     fn complete_messages(result: StreamParseResult) -> Vec<ParsedMessage> {

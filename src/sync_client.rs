@@ -7,7 +7,8 @@ use crate::token::TokenObservation;
 
 pub const BASE_URL: &str = "https://arctracker.io";
 
-/// Timeouts so a stalled connection can't wedge the worker thread.
+/// Shared HTTP agent with connect/read timeouts so a stalled connection can
+/// never wedge the worker thread (and thus the hub) forever.
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
@@ -15,8 +16,9 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-/// Failure from a backend submit call. Carries the HTTP status (when the server
-/// responded) so callers can branch on it instead of sniffing the message.
+/// Failure from a backend submit call, carrying the HTTP status (when the
+/// server responded) so callers can branch on it structurally instead of
+/// sniffing the message string.
 #[derive(Debug)]
 pub struct SubmitError {
     pub status: Option<u16>,
@@ -69,8 +71,12 @@ struct RefreshResponse {
     token: String,
 }
 
-/// Exchange the current bridge JWT for a fresh 30-day token. A 401 here means
-/// the token is expired or revoked; the caller decides whether to sign out.
+/// Exchange the current bridge JWT for a fresh 30-day token.
+///
+/// Calls `POST {BASE_URL}/api/auth/bridge/refresh` with the supplied token
+/// as the `Authorization: Bearer` credential and returns the re-issued token.
+/// A non-2xx (e.g. an expired/revoked token returning 401) surfaces as an
+/// error so the caller can decide whether to sign the user out.
 pub fn submit_refresh(auth_token: &str) -> Result<String, SubmitError> {
     let url = format!("{BASE_URL}/api/auth/bridge/refresh");
     let response = match agent()

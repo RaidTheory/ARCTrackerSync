@@ -4,15 +4,16 @@
 //! These run as an integration-test target, which (unlike the binary) carries no
 //! `requireAdministrator` manifest, so they launch from an ordinary shell.
 //!
-//! Keep this file's name free of `update`/`install`/`setup`/`patch`: those
-//! substrings trip Windows' UAC installer-detection heuristic on the unsigned
-//! test exe, which then demands elevation (os error 740) and breaks `cargo test`.
-//! That's why this isn't named `updater_e2e`.
+//! NOTE: keep this file's name free of `update`/`install`/`setup`/`patch`. Those
+//! substrings trigger Windows' UAC installer-detection heuristic on the unsigned
+//! test exe, which then demands elevation (os error 740) and breaks `cargo test`
+//! (that's why this isn't named `updater_e2e`).
 //!
-//! Covered: release-metadata parsing (incl. the mandatory `SHA256SUMS` gate),
-//! streamed download + hashing, checksum verification, and zip extraction.
-//! `self_replace`, the `icacls` hardening, and the UAC-inherited relaunch are
-//! validated separately in the elevated GUI run.
+//! They cover the parts that don't need a live elevated process: release-metadata
+//! parsing (incl. the mandatory `SHA256SUMS` gate), streamed download + hashing,
+//! checksum verification, and zip extraction. The actual `self_replace`, the
+//! `icacls` hardening, and the UAC-inherited relaunch are validated separately in
+//! the elevated GUI run.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -28,9 +29,9 @@ const EXE_BYTES: &[u8] = b"NEW-ARCTRACKER-SYNC-BINARY-v0.2.0";
 
 // ----- local test server ---------------------------------------------------------
 
-/// Bind a throwaway loopback server and answer each GET by path. Routes are
-/// built from the real base URL so `latest.json` can embed correct asset URLs.
-/// Returns the base URL; the server thread runs for the rest of the test.
+/// Bind a throwaway loopback server, then build its routes from the real base URL
+/// (so `latest.json` can embed correct asset URLs) and answer each GET by path.
+/// Returns the base URL; the server thread is a daemon for the rest of the test.
 fn serve(build_routes: impl FnOnce(&str) -> HashMap<String, Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let base = format!("http://{}", listener.local_addr().expect("addr"));

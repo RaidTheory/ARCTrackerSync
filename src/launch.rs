@@ -295,72 +295,38 @@ pub fn is_epic_game_path(path: &Path) -> bool {
         .any(|location| path_starts_with(path, &location))
 }
 
-/// A user-set SSLKEYLOGFILE override (env var or registry) that was ignored
-/// because it can't be a usable keylog file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkippedSyncKey {
-    pub kind: SyncKeySourceKind,
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncKeyResolution {
-    pub source: SyncKeySource,
-    pub skipped: Vec<SkippedSyncKey>,
-}
-
-pub fn resolve_current_sync_key_source() -> Result<SyncKeyResolution> {
+pub fn resolve_current_sync_key_source() -> Result<SyncKeySource> {
     let app_owned = config::app_owned_sync_key_path()?;
     Ok(resolve_sync_key_source(
         config::process_sync_key_env(),
         config::registry_sync_key_path(),
         app_owned,
-        sync_key_override_usable,
     ))
 }
 
-/// Pick the sync key path: the first usable user override (process env, then
-/// registry), otherwise the app-owned path. Unusable overrides — e.g. an
-/// SSLKEYLOGFILE left pointing at a folder by another tool — are reported in
-/// `skipped` instead of blocking sync. The app-owned fallback is never skipped.
 pub fn resolve_sync_key_source(
     process_env: Option<PathBuf>,
     registry_env: Option<PathBuf>,
     app_owned: PathBuf,
-    is_usable_file: impl Fn(&Path) -> bool,
-) -> SyncKeyResolution {
-    let mut skipped = Vec::new();
-    for (kind, candidate) in [
-        (SyncKeySourceKind::ProcessEnv, process_env),
-        (SyncKeySourceKind::Registry, registry_env),
-    ] {
-        let Some(path) = candidate else {
-            continue;
+) -> SyncKeySource {
+    if let Some(path) = process_env {
+        return SyncKeySource {
+            kind: SyncKeySourceKind::ProcessEnv,
+            path,
         };
-        if is_usable_file(&path) {
-            return SyncKeyResolution {
-                source: SyncKeySource { kind, path },
-                skipped,
-            };
-        }
-        skipped.push(SkippedSyncKey { kind, path });
     }
 
-    SyncKeyResolution {
-        source: SyncKeySource {
-            kind: SyncKeySourceKind::AppOwned,
-            path: app_owned,
-        },
-        skipped,
+    if let Some(path) = registry_env {
+        return SyncKeySource {
+            kind: SyncKeySourceKind::Registry,
+            path,
+        };
     }
-}
 
-/// An override is honored only when it already points at an existing regular
-/// file (an active Wireshark-style keylog). Anything else falls back to the
-/// app-owned key, which is injected explicitly into the launcher child env, so
-/// a stale system-wide value can't break sync.
-fn sync_key_override_usable(path: &Path) -> bool {
-    path.is_file()
+    SyncKeySource {
+        kind: SyncKeySourceKind::AppOwned,
+        path: app_owned,
+    }
 }
 
 pub fn prepare_sync_key_for_launch(source: &SyncKeySource) -> Result<()> {
@@ -465,7 +431,6 @@ fn graceful_close_launcher(plan: &LauncherSetupPlan) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
 fn force_close_processes(processes: &[LauncherProcess]) -> Result<()> {
     let Some(process_name) = processes.first().map(|process| process.name.as_str()) else {
         return Ok(());
@@ -480,17 +445,6 @@ fn force_close_processes(processes: &[LauncherProcess]) -> Result<()> {
     Ok(())
 }
 
-/// Linux has no `taskkill`; send `SIGKILL` to each matched PID directly.
-#[cfg(target_os = "linux")]
-fn force_close_processes(processes: &[LauncherProcess]) -> Result<()> {
-    for process in processes {
-        unsafe {
-            libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
-        }
-    }
-    Ok(())
-}
-
 fn wait_until_process_exits(process_name: &str, timeout: Duration) -> Result<bool> {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -502,7 +456,6 @@ fn wait_until_process_exits(process_name: &str, timeout: Duration) -> Result<boo
     Ok(process_env::find_processes(process_name)?.is_empty())
 }
 
-#[cfg(not(target_os = "linux"))]
 fn find_steam_exe() -> Result<PathBuf> {
     if let Some(path) = config::steam_install_path().map(|path| path.join("steam.exe")) {
         if path.exists() {
@@ -520,29 +473,6 @@ fn find_steam_exe() -> Result<PathBuf> {
     }
 
     Err(anyhow!("Steam was not found"))
-}
-
-/// On Linux Steam is the `steam` wrapper script on `PATH`. Returning the bare
-/// command lets `Command::new` resolve it, and `steam -shutdown` /
-/// `steam steam://...` work the same as the Windows exe path.
-#[cfg(target_os = "linux")]
-fn find_steam_exe() -> Result<PathBuf> {
-    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = Path::new(dir).join("steam");
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    // Flatpak fallback: no `steam` on PATH, but the app id is launchable.
-    if Path::new("/var/lib/flatpak/exports/bin/com.valvesoftware.Steam").exists() {
-        return Ok(PathBuf::from(
-            "/var/lib/flatpak/exports/bin/com.valvesoftware.Steam",
-        ));
-    }
-    Err(anyhow!("Steam was not found on PATH"))
 }
 
 fn find_epic_launcher_exe() -> Result<PathBuf> {
@@ -586,14 +516,12 @@ fn epic_manifest_install_locations() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Auto-detect the ARC Raiders executable from the Epic manifests
-/// (`LaunchExecutable` under `InstallLocation`), so Epic owners skip the
-/// manual file picker.
+/// Auto-detect the ARC Raiders executable from the Epic manifests (the game's
+/// `LaunchExecutable` under its `InstallLocation`), so Epic owners skip the
+/// manual file picker — mirroring Steam's registry-based detection.
 pub fn find_epic_game_executable() -> Option<PathBuf> {
     for manifest in read_epic_manifests() {
-        let install = manifest
-            .get("InstallLocation")
-            .and_then(|value| value.as_str());
+        let install = manifest.get("InstallLocation").and_then(|value| value.as_str());
         let launch_exe = manifest
             .get("LaunchExecutable")
             .and_then(|value| value.as_str());
@@ -622,7 +550,8 @@ pub fn find_epic_game_executable() -> Option<PathBuf> {
     None
 }
 
-/// Which stores have ARC Raiders installed right now: `(steam, epic_exe)`.
+/// Which stores have ARC Raiders installed right now: `(steam, epic_exe)`. One
+/// detection path shared by first-run auto-select and the hub launcher toggle.
 pub fn detect_installed_launchers() -> (bool, Option<PathBuf>) {
     (steam_game_installed(), find_epic_game_executable())
 }
@@ -641,9 +570,10 @@ fn steam_library_paths() -> Vec<PathBuf> {
     let mut paths = vec![steam.clone()];
 
     // Additional libraries are listed in libraryfolders.vdf. The modern format
-    // uses `"path"  "<dir>"`; legacy files use a numeric index instead
-    // (`"1"  "<dir>"`), so scan every quoted pair and take any `"path"` key
-    // plus any numeric-index key rather than matching on line prefix.
+    // uses `"path"  "<dir>"`, but legacy files use a numeric index instead
+    // (`"1"  "<dir>"`). Rather than match on the line prefix — which breaks on
+    // unusual indentation or the legacy layout — scan every quoted token and
+    // collect the value of any `"path"` pair plus any numeric-index pair.
     if let Ok(text) = fs::read_to_string(steam.join("steamapps").join("libraryfolders.vdf")) {
         for line in text.lines() {
             let mut tokens = quoted_tokens(line);
@@ -658,8 +588,8 @@ fn steam_library_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Each double-quoted token on a line, in order — enough to read VDF pairs
-/// without a VDF crate.
+/// Yield the contents of each double-quoted token on a line, in order. Used to
+/// parse VDF key/value pairs without depending on a VDF crate.
 fn quoted_tokens(line: &str) -> impl Iterator<Item = &str> {
     let mut rest = line;
     std::iter::from_fn(move || {
@@ -703,106 +633,21 @@ mod tests {
         let registry = PathBuf::from("C:\\temp\\registry.log");
         let app_owned = PathBuf::from("C:\\temp\\app-owned.log");
 
-        let resolution = resolve_sync_key_source(
+        let source = resolve_sync_key_source(
             Some(process.clone()),
             Some(registry.clone()),
             app_owned.clone(),
-            |_| true,
         );
-        assert_eq!(resolution.source.kind, SyncKeySourceKind::ProcessEnv);
-        assert_eq!(resolution.source.path, process);
-        assert!(resolution.skipped.is_empty());
+        assert_eq!(source.kind, SyncKeySourceKind::ProcessEnv);
+        assert_eq!(source.path, process);
 
-        let resolution =
-            resolve_sync_key_source(None, Some(registry.clone()), app_owned.clone(), |_| true);
-        assert_eq!(resolution.source.kind, SyncKeySourceKind::Registry);
-        assert_eq!(resolution.source.path, registry);
-        assert!(resolution.skipped.is_empty());
+        let source = resolve_sync_key_source(None, Some(registry.clone()), app_owned.clone());
+        assert_eq!(source.kind, SyncKeySourceKind::Registry);
+        assert_eq!(source.path, registry);
 
-        let resolution = resolve_sync_key_source(None, None, app_owned.clone(), |_| true);
-        assert_eq!(resolution.source.kind, SyncKeySourceKind::AppOwned);
-        assert_eq!(resolution.source.path, app_owned);
-        assert!(resolution.skipped.is_empty());
-    }
-
-    #[test]
-    fn sync_key_resolution_skips_unusable_overrides() {
-        let process = PathBuf::from("C:\\Users\\someone\\Documents");
-        let registry = PathBuf::from("C:\\temp\\registry.log");
-        let app_owned = PathBuf::from("C:\\temp\\app-owned.log");
-
-        // Only the process-env value is unusable: fall through to the registry.
-        let resolution = resolve_sync_key_source(
-            Some(process.clone()),
-            Some(registry.clone()),
-            app_owned.clone(),
-            |path| path != process,
-        );
-        assert_eq!(resolution.source.kind, SyncKeySourceKind::Registry);
-        assert_eq!(resolution.source.path, registry);
-        assert_eq!(
-            resolution.skipped,
-            vec![SkippedSyncKey {
-                kind: SyncKeySourceKind::ProcessEnv,
-                path: process.clone(),
-            }]
-        );
-
-        let resolution = resolve_sync_key_source(
-            Some(process.clone()),
-            Some(registry.clone()),
-            app_owned.clone(),
-            |_| false,
-        );
-        assert_eq!(resolution.source.kind, SyncKeySourceKind::AppOwned);
-        assert_eq!(resolution.source.path, app_owned);
-        assert_eq!(
-            resolution.skipped,
-            vec![
-                SkippedSyncKey {
-                    kind: SyncKeySourceKind::ProcessEnv,
-                    path: process,
-                },
-                SkippedSyncKey {
-                    kind: SyncKeySourceKind::Registry,
-                    path: registry,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn sync_key_resolution_never_skips_app_owned() {
-        let app_owned = PathBuf::from("C:\\temp\\app-owned.log");
-
-        // App-owned is selected even when nothing satisfies the predicate.
-        let resolution = resolve_sync_key_source(None, None, app_owned.clone(), |_| false);
-        assert_eq!(resolution.source.kind, SyncKeySourceKind::AppOwned);
-        assert_eq!(resolution.source.path, app_owned);
-        assert!(resolution.skipped.is_empty());
-    }
-
-    #[test]
-    fn sync_key_override_usable_requires_existing_regular_file() {
-        let temp_dir = unique_temp_dir("override-usable");
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let file_path = temp_dir.join("keys.log");
-        fs::write(&file_path, b"CLIENT_RANDOM ...").expect("write file");
-
-        assert!(
-            !sync_key_override_usable(&temp_dir),
-            "directory is not usable"
-        );
-        assert!(
-            sync_key_override_usable(&file_path),
-            "existing file is usable"
-        );
-        assert!(
-            !sync_key_override_usable(&temp_dir.join("missing.log")),
-            "nonexistent path is not usable"
-        );
-
-        let _ = fs::remove_dir_all(&temp_dir);
+        let source = resolve_sync_key_source(None, None, app_owned.clone());
+        assert_eq!(source.kind, SyncKeySourceKind::AppOwned);
+        assert_eq!(source.path, app_owned);
     }
 
     #[test]

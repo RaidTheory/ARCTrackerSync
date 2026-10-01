@@ -1,17 +1,19 @@
 //! Localization for ARCTracker Sync.
 //!
-//! Wraps `rust-i18n` over this app's own per-locale catalogs in
+//! Wraps `rust-i18n` over the Sync app's own per-locale catalogs in
 //! `apps/arctracker-sync/locales/<locale>.json` (rust-i18n `_version: 1`, flat
-//! `SyncApp.*` keys, `%{var}` placeholders). The web app's `messages/` are
-//! unaffected. `en.json` is the source of truth; the other 19 locales are
-//! translations. Every user-facing string flows through [`tr!`].
+//! `SyncApp.*` keys, `%{var}` placeholders). These files are owned entirely by
+//! this app — the web app's `messages/` are unaffected. `en.json` is the source
+//! of truth; the other 19 locales are translations. Every user-facing string
+//! flows through [`tr!`].
 //!
 //! The `rust_i18n::i18n!("locales", fallback = "en")` invocation lives in
-//! `lib.rs` because `t!` resolves the generated catalog items relative to
-//! `crate::`.
+//! `lib.rs` (the crate root) because `t!` resolves the generated catalog items
+//! relative to `crate::`.
 
-/// The 20 ARCTracker UI locales, in language-picker display order (mirrors
-/// `UI_LOCALES` in `apps/web/src/config/locales.ts`).
+/// Ordered list of the 20 ARCTracker UI locales (mirrors `UI_LOCALES` in
+/// `apps/web/src/config/locales.ts`). Order is the display order used by the
+/// language picker.
 pub const UI_LOCALES: &[&str] = &[
     "en", "de", "fr", "es", "pt", "pt-BR", "pl", "no", "da", "it", "ja", "ko", "zh-CN", "zh-TW",
     "ru", "tr", "uk", "hr", "sr", "he",
@@ -63,18 +65,21 @@ pub fn resolve_locale(preferred: Option<&str>) -> &'static str {
     "en"
 }
 
+/// Apply a locale globally so every later [`tr!`] call uses it.
 pub fn set_active_locale(locale: &str) {
     let resolved = match_supported(locale).unwrap_or("en");
     rust_i18n::set_locale(resolved);
 }
 
+/// The locale rust-i18n is currently rendering.
 pub fn active_locale() -> String {
     rust_i18n::locale().to_string()
 }
 
-/// Map an arbitrary BCP-47 tag to the nearest supported UI locale: exact
-/// match, then the script-qualified Chinese variants, then the bare language
-/// subtag (`de-AT` → `de`).
+/// Map an arbitrary BCP-47 tag to the nearest supported UI locale.
+///
+/// Tries an exact match, then the script-qualified Chinese variants, then the
+/// bare language subtag (so `de-AT` resolves to `de`, `pt-PT` to `pt`).
 fn match_supported(tag: &str) -> Option<&'static str> {
     let normalized = normalize_tag(tag);
 
@@ -98,6 +103,7 @@ fn match_supported(tag: &str) -> Option<&'static str> {
         return Some("zh-CN");
     }
 
+    // Portuguese: Brazil keeps its own catalog, everything else uses pt.
     if normalized.starts_with("pt") {
         if normalized.contains("br") {
             return Some("pt-BR");
@@ -134,7 +140,8 @@ macro_rules! tr {
     };
 }
 
-/// Backing function for [`tr!`].
+/// Backing function for [`tr!`]. Looks up `key`, then substitutes each
+/// `%{name}` placeholder with the supplied value.
 #[doc(hidden)]
 pub fn __translate(key: &str, args: &[(&str, String)]) -> String {
     let mut text = rust_i18n::t!(key).to_string();
@@ -225,27 +232,10 @@ mod tests {
             __translate("SyncApp.state.signedOut.title", &[]),
             "SyncApp.state.signedOut.title"
         );
-        // The post-sync Stash CTA key must resolve to real text, not the raw key.
-        assert_eq!(
-            __translate("SyncApp.action.viewStash", &[]),
-            "View your stash"
-        );
         // Named placeholder interpolation (%{var}) works end to end.
         assert_eq!(
-            __translate(
-                "SyncApp.footer.signedInAs",
-                &[("account", "Matt".to_string())]
-            ),
+            __translate("SyncApp.footer.signedInAs", &[("account", "Matt".to_string())]),
             "Signed in as Matt"
-        );
-        // The capture-method settings keys must resolve to real text.
-        assert_eq!(
-            __translate("SyncApp.settings.captureMethod", &[]),
-            "Capture method"
-        );
-        assert_ne!(
-            __translate("SyncApp.state.needsAttention.npcapBody", &[]),
-            "SyncApp.state.needsAttention.npcapBody"
         );
     }
 }

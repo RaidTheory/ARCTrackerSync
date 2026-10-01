@@ -1,19 +1,21 @@
 //! Single-instance guard.
 //!
-//! Launching the exe again must not open a second copy: the duplicate signals
-//! the running instance to come to the foreground and exits. Two session-local
-//! named kernel objects:
+//! ARCTracker Sync should run as one window per session. Launching the exe again
+//! must not open a second copy: instead it signals the running instance to come
+//! to the foreground and exits. We use two session-local named kernel objects:
 //!
-//! - a named mutex to detect that an instance already owns this session, and
-//! - a named auto-reset event the new launch sets to wake the running one.
+//! - a **named mutex** to detect that an instance already owns this session, and
+//! - a **named auto-reset event** the new launch sets to wake the running one.
 //!
-//! The app always runs elevated (`RequireAdministrator`), so every launch
-//! shares the same session and integrity level and sees the same names.
+//! Both objects live in the per-session namespace. The app always runs elevated
+//! (`RequireAdministrator`), so every launch shares the same session and
+//! integrity level and sees the same names.
 //!
-//! The process the updater spawns with `--relaunched` is special: the old
-//! instance is mid-exit and still holds the mutex for a moment, so the
-//! relaunched copy takes over as primary instead of treating itself as a
-//! duplicate — otherwise an update would momentarily leave zero instances.
+//! The freshly-installed process the updater spawns (`relaunch`, passing
+//! `--relaunched`) is special: the old instance is mid-exit and still holds the
+//! mutex for a moment, so the relaunched copy *waits* for the mutex instead of
+//! treating itself as a duplicate. That keeps exactly one instance alive across
+//! an update rather than leaving zero.
 
 #[cfg(windows)]
 pub use windows::{acquire, signal_existing, Acquisition, PrimaryGuard};
@@ -30,19 +32,22 @@ mod windows {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
-    /// Session-local: no `Global\` prefix.
+    /// Session-local names. The `.` separators keep them distinct from any
+    /// global object and out of the `Global\` namespace.
     const MUTEX_NAME: &str = "ARCTrackerSync.SingleInstance.Mutex";
     const EVENT_NAME: &str = "ARCTrackerSync.SingleInstance.Event";
 
     const ERROR_ALREADY_EXISTS: u32 = 183;
     const WAIT_OBJECT_0: u32 = 0;
     const EVENT_MODIFY_STATE: u32 = 0x0002;
-    /// `AllowSetForegroundWindow(ASFW_ANY)` lets any process take foreground —
-    /// how the background instance is permitted to raise its window when signaled.
+    /// `AllowSetForegroundWindow(ASFW_ANY)` lets any process steal foreground,
+    /// which is how the (background) running instance is permitted to raise its
+    /// window when we signal it.
     const ASFW_ANY: u32 = 0xFFFF_FFFF;
     /// Listener wake cadence; also the responsiveness of the stop check on quit.
     const LISTEN_TICK_MS: u32 = 750;
 
+    /// Outcome of trying to become the session's sole instance.
     pub enum Acquisition {
         /// We own the session. Keep the guard for the process lifetime.
         Primary(PrimaryGuard),
@@ -50,9 +55,11 @@ mod windows {
         AlreadyRunning,
     }
 
+    /// Holds the named objects for the lifetime of the primary instance.
     pub struct PrimaryGuard {
-        // Never read; an open handle keeps the named mutex alive so peers keep
-        // seeing ERROR_ALREADY_EXISTS, and closes it on drop.
+        // Held only for its lifetime/Drop effect: an open handle keeps the named
+        // mutex alive (so peers keep seeing ERROR_ALREADY_EXISTS) and closes it on
+        // drop. Never read directly, hence the allow.
         #[allow(dead_code)]
         mutex: Handle,
         event: Handle,
@@ -60,15 +67,16 @@ mod windows {
 
     /// Try to become the sole instance.
     ///
-    /// `relaunched` is true only for the updater's freshly-spawned process: the
-    /// exiting instance still holds a mutex handle for a moment, so a relaunch
-    /// must take over as primary rather than defer. Both holding a handle to the
-    /// same named mutex briefly is fine; the old one closes when that process exits.
+    /// `relaunched` is true only for the updater's freshly-spawned process. The
+    /// old instance is exiting but still holds a mutex handle for a moment, so a
+    /// relaunch must take over as primary rather than defer — otherwise an update
+    /// could momentarily leave zero instances. Both holding a handle to the same
+    /// named mutex briefly is fine; the old handle closes when that process exits.
     pub fn acquire(relaunched: bool) -> Acquisition {
         let mutex = create_mutex();
-        // Only a valid handle plus ERROR_ALREADY_EXISTS means a peer owns the
-        // session. A creation failure (null) falls through to Primary rather
-        // than wrongly exiting as a duplicate.
+        // Only a valid handle reporting ERROR_ALREADY_EXISTS means a peer instance
+        // owns the session. A creation failure (null) falls through to Primary as
+        // a best effort rather than wrongly exiting as a duplicate.
         let peer_running = !mutex.is_null() && last_error() == ERROR_ALREADY_EXISTS;
 
         if peer_running && !relaunched {
@@ -80,8 +88,8 @@ mod windows {
         Acquisition::Primary(PrimaryGuard { mutex, event })
     }
 
-    /// Wake the running instance so it raises its window; the duplicate launch
-    /// then exits.
+    /// Wake the running instance so it raises its window, then return so the
+    /// caller (the duplicate launch) can exit.
     pub fn signal_existing() {
         // Grant the background instance the right to take foreground first.
         unsafe { AllowSetForegroundWindow(ASFW_ANY) };
@@ -97,14 +105,15 @@ mod windows {
     }
 
     impl PrimaryGuard {
-        /// Spawn a thread that waits on the named event and calls `on_signal`
-        /// each time a duplicate launch wakes us; exits (closing the handles)
-        /// once `stop` is set.
+        /// Spawn the listener thread that waits on the named event and calls
+        /// `on_signal` each time a duplicate launch wakes us. Stops (closing the
+        /// handles) once `stop` is set. The objects are owned by the thread so
+        /// they outlive `self` for the rest of the process.
         pub fn spawn_listener(self, stop: Arc<AtomicBool>, on_signal: impl Fn() + Send + 'static) {
-            // No event handle means we can't listen; the mutex still guards
-            // against duplicates, they just won't raise our window. Forget self
-            // so the mutex stays alive for the process lifetime.
+            // No event handle (creation failed) means we cannot listen; the mutex
+            // still guards against duplicates, they just won't raise our window.
             if self.event.is_null() {
+                // Keep the mutex alive for the process lifetime regardless.
                 std::mem::forget(self);
                 return;
             }
@@ -119,6 +128,7 @@ mod windows {
                         on_signal();
                     }
                 }
+                // `self` (mutex + event handles) drops here, closing both.
                 drop(self);
             });
         }
@@ -126,7 +136,7 @@ mod windows {
 
     fn create_mutex() -> Handle {
         let name = wide_null(MUTEX_NAME);
-        // initial_owner = 0: we only need to detect the mutex, not own it.
+        // initial_owner = 0: we don't need to own it, only to detect/observe it.
         Handle(unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) })
     }
 
@@ -196,7 +206,8 @@ mod stub {
 
     pub struct PrimaryGuard;
 
-    /// The app ships Windows-only; the stub keeps the crate cross-compilable.
+    /// Non-Windows builds are always the sole instance (the app ships Windows-only;
+    /// this keeps the crate cross-compilable).
     pub fn acquire(_relaunched: bool) -> Acquisition {
         Acquisition::Primary(PrimaryGuard)
     }

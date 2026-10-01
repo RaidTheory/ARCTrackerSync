@@ -1,9 +1,8 @@
 // Always use the GUI subsystem so no console window opens alongside the app.
 // (If logs are needed for debugging, route tracing to a file instead.)
-// No-op off Windows; gated so the attribute only applies where it's meaningful.
-#![cfg_attr(windows, windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
-use arctracker_sync::{app, config, i18n, single_instance};
+use arctracker_sync::{config, i18n, retired, single_instance};
 
 fn main() -> eframe::Result<()> {
     let _ = tracing_subscriber::fmt().try_init();
@@ -32,23 +31,25 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([760.0, 500.0])
             .with_min_inner_size([700.0, 460.0])
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_resizable(true)
             .with_icon(app_icon())
             .with_title(i18n::__translate("SyncApp.appName", &[])),
         ..Default::default()
     };
 
-    // `primary` is moved into the app so it can spawn the listener once it has a
-    // window handle and egui context; holding it keeps the named objects alive.
+    // ARCTracker Sync is retired: ARC Tracker Link replaces it. This final
+    // release only shows the retirement screen. The sync hub
+    // (`app::SharedArcTrackerSyncApp`) is never started, so nothing is captured,
+    // prepared, uploaded or checked for updates.
+    //
+    // `primary` is moved into the app so it can spawn the listener once it has an
+    // egui context; holding it keeps the named objects alive.
     let mut primary = Some(primary);
     eframe::run_native(
         "ARCTracker Sync",
         native_options,
         Box::new(move |cc| {
             let guard = primary.take().expect("app factory called once");
-            Ok(Box::new(app::SharedArcTrackerSyncApp::new(cc, guard)))
+            Ok(Box::new(retired::RetiredApp::new(cc, guard)))
         }),
     )
 }

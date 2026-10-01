@@ -1,44 +1,26 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{
-    self, pos2, vec2, Align, Color32, CornerRadius, Frame, Layout, Rect, RichText, Sense, Stroke,
-    UiBuilder,
-};
+use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Margin, RichText, Stroke, Vec2};
 
 use crate::auth_bridge;
 use crate::capture::{self, CaptureEvent, CaptureHandle, CaptureStats, InterfaceInfo};
-use crate::capture_backend::CaptureMethod;
 use crate::config::{self, AppConfig};
 use crate::credential_store;
 use crate::elevation;
 use crate::fonts;
 use crate::i18n;
 use crate::launch::{self, LauncherPlatform, LauncherStatus};
-use crate::npcap::Npcap;
 use crate::single_instance;
 use crate::sync_client::{self, SubmitError, SubmitResponse, BASE_URL};
-use crate::theme::{
-    self, apply_arc_theme, arc_bg, arc_border, arc_border_soft, arc_border_strong, arc_fg_dim,
-    arc_foreground, arc_input, arc_muted_text, arc_primary, arc_success, arc_titlebar, arc_warning,
-};
 use crate::token::TokenObservation;
 use crate::tr;
-#[cfg(windows)]
-use crate::tray::TrayCommandHandler;
-use crate::tray::{self, TrayCommand, TrayController};
+use crate::tray::{self, TrayCommand, TrayCommandHandler, TrayController};
 use crate::updater::{self, InstallProgress, ReleaseInfo};
-use crate::widgets::{
-    arc_modal, back_button, clickable_pill, hairline, icon_tile, inline_check, launcher_segment,
-    link_button, mono_eyebrow, pill, primary_button, refresh_badge, resize_handles,
-    secondary_button, secondary_button_full, settings_button, settings_card, settings_row,
-    spinner_row, stage, toggle_switch, tone_card, top_glow, vertical_stepper, window_button,
-    StageState, StepperNode, WindowButton,
-};
 
 type AuthResult = Result<String, String>;
 type SubmitResult = Result<(String, SubmitResponse), SubmitError>;
@@ -48,21 +30,19 @@ type RefreshResult = Result<String, SubmitError>;
 /// launcher runs as `PioneerGame.exe`; once it hands off, the running game is
 /// `PioneerGame-e.exe` (EAC) or `PioneerGame-d.exe`.
 const GAME_PROCESS_NAMES: &[&str] = &["PioneerGame.exe", "PioneerGame-e.exe", "PioneerGame-d.exe"];
+/// General help / troubleshooting destination.
 const HELP_URL: &str = "https://arctracker.io/help/sync";
-/// Where a synced user goes to view their inventory on the web app.
-const STASH_URL: &str = "https://arctracker.io/stash";
-/// Where the user installs Npcap from; never bundled or downloaded by the app.
-const NPCAP_URL: &str = "https://npcap.com/#download";
 /// Refresh the bridge token when fewer than this many days remain.
 const REFRESH_THRESHOLD_DAYS: i64 = 7;
+/// How often to proactively refresh the bridge token while running.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-/// How often to check GitHub for a newer release; one check also runs on
-/// startup. The 750ms worker loop only notices this interval elapsing — it
-/// never makes a network call every tick.
+/// How often to check GitHub for a newer release while running (a check also
+/// runs once on startup). The 750ms worker loop only *notices* this interval
+/// elapsing — it never makes a network call every tick.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// The adaptive hub state (spec §4). The hero card is a pure function of this
-/// value, recomputed every frame.
+/// The single adaptive hub state (spec §4). The hero card is a pure function of
+/// this value; it is recomputed every frame from the app's booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HubState {
     NeedsAdmin,
@@ -81,26 +61,31 @@ enum HubState {
     NeedsAttention,
 }
 
+/// Which screen the window is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Hub,
     Settings,
 }
 
-/// Self-updater lifecycle, driving the header pill and the changelog/install
-/// dialog. Release details live in `current_release`.
+/// Lifecycle of the in-app self-updater, driving the header pill and the
+/// changelog/install dialog. The release details themselves live in
+/// `current_release`; this enum only tracks where in the flow we are.
 #[derive(Debug, Clone)]
 enum UpdateState {
     /// No newer release known (or we're between checks).
     Idle,
+    /// A newer release is available; the pill is shown and the dialog offers it.
     Available,
-    Downloading {
-        received: u64,
-        total: Option<u64>,
-    },
+    /// Downloading the release package.
+    Downloading { received: u64, total: Option<u64> },
+    /// Validating the download.
     Verifying,
+    /// Swapping the executable in place.
     Installing,
+    /// Install done; relaunching on the new version.
     Relaunching,
+    /// Download/verify/install failed; the dialog shows the reason + Retry.
     Failed(String),
 }
 
@@ -122,8 +107,9 @@ impl SharedArcTrackerSyncApp {
         Self { inner: app }
     }
 
-    /// Raise the window when a second launch wakes us. Goes through the tray
-    /// "Open" path so behavior matches the tray menu.
+    /// Listen for a second launch waking us, and raise the window when it does.
+    /// Reuses the tray "Open" path so behavior is identical to the tray menu
+    /// (switch to the hub and bring the window to the foreground).
     fn start_single_instance_listener(
         app: &Arc<Mutex<ArcTrackerSyncApp>>,
         ctx: egui::Context,
@@ -219,42 +205,13 @@ extern "system" {
 pub struct ArcTrackerSyncApp {
     config: AppConfig,
     locale: String,
-    /// True once the heavier all-CJK font stack has been loaded so the language
-    /// picker renders every native name. Loaded lazily the first time that
-    /// dropdown opens, then kept for the session so reopening never flickers.
-    picker_fonts_loaded: bool,
     screen: Screen,
     show_activity_log: bool,
     show_explainer: bool,
-    /// Last measured hero-content height, used to vertically center the hub's
-    /// right panel without an ahead-of-time measure pass.
-    hero_content_height: f32,
 
     interfaces: Vec<InterfaceInfo>,
     selected_interface_index: usize,
     sync_key_source: Option<launch::SyncKeySource>,
-    /// User-set SSLKEYLOGFILE overrides that were ignored because they don't
-    /// point at a usable file (kept for the diagnostics dump).
-    sync_key_skipped: Vec<launch::SkippedSyncKey>,
-    /// Token submissions started this session (kept for the diagnostics dump,
-    /// to distinguish "never attempted" from "attempted and failed").
-    submit_attempts: u32,
-    /// Last token-submission failure, path-scrubbed but unredacted (the
-    /// activity log entry for it may be collapsed to customer copy).
-    last_sync_error: Option<String>,
-    /// When the last submission failed; drives the backoff retry. `None` while
-    /// idle, synced, or hard-stopped (see `submit_gave_up`).
-    submit_failed_at: Option<Instant>,
-    /// Consecutive failed submissions for the current token; indexes the
-    /// `submit_backoff` schedule and resets on success or a new token.
-    consecutive_submit_failures: u32,
-    /// Whether we've already refreshed the ARCTracker sign-in for the current
-    /// failure episode — bounds `/api/auth/bridge/refresh` to one call per
-    /// episode instead of one per retry (the 401 ping-pong).
-    refreshed_for_current_failure: bool,
-    /// Set when backoff is exhausted: automatic retries stop until the user
-    /// hits "Try again" or a new token arrives. Surfaces `NeedsAttention`.
-    submit_gave_up: bool,
     launcher_readiness: launch::LauncherReadiness,
     last_launcher_check: Instant,
     force_close_available: bool,
@@ -270,15 +227,11 @@ pub struct ArcTrackerSyncApp {
 
     capture: Option<CaptureHandle>,
     capture_blocked: bool,
-    /// TTL-cached `Npcap::is_installed()`; `None` until first probed. Only
-    /// maintained while the Npcap capture method is selected.
-    npcap_available: Option<bool>,
-    last_npcap_check: Instant,
     stats: CaptureStats,
     latest_token: Option<TokenObservation>,
     auth_token: Option<String>,
     account_name: Option<String>,
-    mark_texture: Option<egui::TextureHandle>,
+    last_synced_label: Option<String>,
 
     auth_rx: Option<Receiver<AuthResult>>,
     submit_rx: Option<Receiver<SubmitResult>>,
@@ -302,7 +255,8 @@ pub struct ArcTrackerSyncApp {
     /// Set when a graceful quit is in progress: the next `update()` drains
     /// finished work, stops capture, and asks eframe to close.
     pending_quit: bool,
-    /// Stop flag for the background worker, flipped during graceful shutdown.
+    /// Shared stop flag for the background worker; flipped during graceful
+    /// shutdown so the loop breaks instead of running forever.
     waker_stop: Arc<AtomicBool>,
     window_control: Option<WindowControl>,
 
@@ -318,9 +272,13 @@ pub struct ArcTrackerSyncApp {
 impl ArcTrackerSyncApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut config = config::load();
+        // Which stores actually have ARC Raiders installed (one scan, reused for
+        // first-run auto-select below and the hub's Steam|Epic toggle).
         let (detected_steam, detected_epic_exe) = launch::detect_installed_launchers();
-        // First run with no explicit launcher choice: pick the store that has
-        // the game. Steam first — it launches by app id with no exe path.
+        // First run with no explicit launcher choice: pick the store that has the
+        // game so the hub immediately speaks the right launcher's name (and Epic
+        // owners skip the manual file picker). Steam first — it launches by app id
+        // with no exe path. An explicit Settings choice is respected (only `Auto`).
         if config.platform == LauncherPlatform::Auto && config.game_executable_path.is_none() {
             if detected_steam {
                 config.platform = LauncherPlatform::Steam;
@@ -337,8 +295,8 @@ impl ArcTrackerSyncApp {
         apply_arc_theme(&cc.egui_ctx);
         fonts::apply_locale(&cc.egui_ctx, &locale);
 
-        // The worker owns hidden-tray maintenance because eframe may stop
-        // calling update() for hidden windows.
+        // Shared stop flag for the background worker. The worker owns hidden-tray
+        // maintenance because eframe may stop calling update() for hidden windows.
         let waker_stop = Arc::new(AtomicBool::new(false));
         let window_control = WindowControl::from_creation_context(cc);
 
@@ -373,11 +331,11 @@ impl ArcTrackerSyncApp {
         let launcher_readiness = sync_key_result
             .as_ref()
             .ok()
-            .map(|resolution| {
+            .map(|source| {
                 launch::launcher_readiness(
                     config.platform,
                     config.game_executable_path.as_deref(),
-                    &resolution.source.path,
+                    &source.path,
                 )
             })
             .unwrap_or_else(|| launch::LauncherReadiness {
@@ -395,28 +353,12 @@ impl ArcTrackerSyncApp {
         let mut app = Self {
             config,
             locale,
-            picker_fonts_loaded: false,
             screen: Screen::Hub,
             show_activity_log: false,
             show_explainer: false,
-            hero_content_height: 0.0,
             interfaces: Vec::new(),
             selected_interface_index: 0,
-            sync_key_source: sync_key_result
-                .as_ref()
-                .ok()
-                .map(|resolution| resolution.source.clone()),
-            sync_key_skipped: sync_key_result
-                .as_ref()
-                .ok()
-                .map(|resolution| resolution.skipped.clone())
-                .unwrap_or_default(),
-            submit_attempts: 0,
-            last_sync_error: None,
-            submit_failed_at: None,
-            consecutive_submit_failures: 0,
-            refreshed_for_current_failure: false,
-            submit_gave_up: false,
+            sync_key_source: sync_key_result.as_ref().ok().cloned(),
             launcher_readiness,
             last_launcher_check: Instant::now(),
             force_close_available: false,
@@ -431,16 +373,11 @@ impl ArcTrackerSyncApp {
                 .unwrap_or_else(Instant::now),
             capture: None,
             capture_blocked: false,
-            npcap_available: None,
-            // Backdated so the first frame probes immediately.
-            last_npcap_check: Instant::now()
-                .checked_sub(Duration::from_secs(10))
-                .unwrap_or_else(Instant::now),
             stats: CaptureStats::default(),
             latest_token: None,
             auth_token,
             account_name: None,
-            mark_texture: None,
+            last_synced_label: None,
             auth_rx: None,
             submit_rx: None,
             refresh_rx: None,
@@ -470,45 +407,28 @@ impl ArcTrackerSyncApp {
         };
 
         match sync_key_result {
-            Ok(resolution) => {
-                for skipped in &resolution.skipped {
-                    app.push_message(skipped_sync_key_notice(&skipped.path));
-                }
-                app.push_message(resolution.source.label().to_string());
-            }
+            Ok(source) => app.push_message(source.label().to_string()),
             Err(error) => app.push_message(format!("Local sync setup unavailable: {error:#}")),
         }
         if let Some(message) = auth_message {
             app.push_message(message);
         }
 
-        // Best-effort cleanup of the Run entry older releases wrote for the
-        // removed "Start with Windows" feature.
-        let _ = tray::remove_startup_entry();
+        // Trust the actual HKCU Run entry for the toggle's displayed state.
+        let registered = tray::start_with_windows_enabled();
+        if registered != app.config.start_with_windows {
+            app.config.start_with_windows = registered;
+            app.save_config();
+        }
 
         app.refresh_game_running();
         app.refresh_interfaces();
         app.maybe_refresh_auth_on_launch();
-
-        // Debug aid: `--screen-settings` opens directly on the settings screen
-        // so UI work can be verified without clicking through elevation.
-        #[cfg(debug_assertions)]
-        if std::env::args().any(|arg| arg == "--screen-settings") {
-            app.screen = Screen::Settings;
-        }
-
         app
     }
 
     // ----- tray / window lifecycle -------------------------------------------------
 
-    /// No system tray off Windows: leave `self.tray` as None so the window-close
-    /// button quits instead of hiding the window into a tray that isn't there
-    /// (which left the process running with no way to bring it back).
-    #[cfg(not(windows))]
-    fn init_tray(&mut self, _app: Weak<Mutex<ArcTrackerSyncApp>>, _ctx: egui::Context) {}
-
-    #[cfg(windows)]
     fn init_tray(&mut self, app: Weak<Mutex<ArcTrackerSyncApp>>, ctx: egui::Context) {
         let handler: TrayCommandHandler = Arc::new(move |command| {
             let Some(app) = app.upgrade() else {
@@ -559,8 +479,9 @@ impl ArcTrackerSyncApp {
         }
     }
 
-    /// Routes through the graceful shutdown path so Drop runs and any
-    /// just-finished work is persisted.
+    /// Fully quit — reliable from both the tray menu and the in-app button.
+    /// Routes through the graceful shutdown path so Drop runs (capture stops,
+    /// the tray icon is removed) and any just-finished work is persisted.
     fn quit(&mut self) {
         self.begin_graceful_quit();
     }
@@ -630,32 +551,9 @@ impl ArcTrackerSyncApp {
         self.save_config();
         self.locale = resolved;
         i18n::set_active_locale(&self.locale);
-        self.apply_locale_fonts(ctx);
+        fonts::apply_locale(ctx, &self.locale);
         self.tray_tooltip = String::new();
         self.update_tray_tooltip();
-    }
-
-    /// Rebuild the font stack for the active locale, preserving the all-CJK set
-    /// if the language picker has already pulled it in this session.
-    fn apply_locale_fonts(&self, ctx: &egui::Context) {
-        if self.picker_fonts_loaded {
-            fonts::apply_locale_with_all_cjk(ctx, &self.locale);
-        } else {
-            fonts::apply_locale(ctx, &self.locale);
-        }
-    }
-
-    /// Load the all-CJK font stack the first time the language picker opens, so
-    /// the non-active CJK native names stop rendering as tofu.
-    fn ensure_picker_fonts(&mut self, ctx: &egui::Context) {
-        if self.picker_fonts_loaded {
-            return;
-        }
-        self.picker_fonts_loaded = true;
-        fonts::apply_locale_with_all_cjk(ctx, &self.locale);
-        // The new fonts apply next frame; repaint so the just-opened picker
-        // shows the native names without waiting for the next input event.
-        ctx.request_repaint();
     }
 
     // ----- silent refresh ----------------------------------------------------------
@@ -691,10 +589,8 @@ impl ArcTrackerSyncApp {
         self.poll_auth();
         self.poll_capture();
         self.poll_submit();
-        self.maybe_retry_token_submission();
         self.poll_refresh();
         self.refresh_launcher_readiness_if_needed();
-        self.refresh_npcap_available_if_needed();
         self.refresh_game_running_if_needed();
         self.maybe_refresh_auth_on_timer();
         self.maybe_check_for_update();
@@ -708,17 +604,16 @@ impl ArcTrackerSyncApp {
 
     // ----- self-update -------------------------------------------------------------
 
+    /// Whether the header "update available" pill should show: any time there's
+    /// something to act on (available, installing, or a failure to retry).
     fn update_indicator_visible(&self) -> bool {
         !matches!(self.update_state, UpdateState::Idle)
     }
 
+    /// Kick off a background release check, throttled to `UPDATE_CHECK_INTERVAL`.
+    /// No-ops while a check/install is in flight or an update is already known,
+    /// so it only re-checks from `Idle` (or after a failed attempt).
     fn maybe_check_for_update(&mut self) {
-        // Self-update ships only a Windows release; the installer extracts
-        // `arctracker-sync.exe` from the zip, which a Linux build would never
-        // match. Linux runs from a source build, so don't check or offer one.
-        if !cfg!(windows) {
-            return;
-        }
         if self.update_check_rx.is_some() || self.update_progress_rx.is_some() {
             return;
         }
@@ -752,8 +647,8 @@ impl ArcTrackerSyncApp {
                 // Already current: stay Idle and check again next interval.
             }
             Ok(Err(error)) => {
-                // Failed checks are routine (offline, rate-limited); don't
-                // surface them to the user.
+                // A failed check is routine (offline, rate-limited) — log quietly
+                // and retry next cycle rather than surfacing it to the user.
                 tracing::debug!(error = %error, "update check failed");
             }
             Err(mpsc::TryRecvError::Empty) => self.update_check_rx = Some(rx),
@@ -907,12 +802,6 @@ impl ArcTrackerSyncApp {
         if self.capture_blocked {
             return HubState::NeedsAttention;
         }
-        // Submission backoff exhausted: surface attention (with Try again)
-        // instead of a perpetual "Connecting…", and stop retrying in the
-        // background until the user acts.
-        if self.submit_gave_up {
-            return HubState::NeedsAttention;
-        }
         if self.token_submitted {
             return if self.game_running {
                 HubState::Synced
@@ -952,19 +841,14 @@ impl ArcTrackerSyncApp {
         }
     }
 
+    /// Title + body for the current state, fully localized.
     fn hub_copy(&self, state: HubState) -> (String, String) {
         let account = self.account_name.clone().unwrap_or_default();
+        let time = self.last_synced_label.clone().unwrap_or_default();
         match state {
             HubState::NeedsAdmin => (
                 tr!("SyncApp.state.needsAdmin.title"),
-                // Windows gates raw-socket capture behind Administrator; Linux
-                // gates it behind CAP_NET_RAW (setcap/root), so the explanation
-                // and the action differ by platform.
-                if cfg!(windows) {
-                    tr!("SyncApp.state.needsAdmin.body")
-                } else {
-                    tr!("SyncApp.state.needsAdmin.bodyLinux")
-                },
+                tr!("SyncApp.state.needsAdmin.body"),
             ),
             HubState::SignedOut => (
                 tr!("SyncApp.state.signedOut.title"),
@@ -1004,16 +888,11 @@ impl ArcTrackerSyncApp {
             ),
             HubState::Synced => (
                 tr!("SyncApp.state.synced.title"),
-                tr!("SyncApp.state.synced.body", account => account),
+                tr!("SyncApp.state.synced.body", account => account, time => time),
             ),
             HubState::SyncedIdle => (
                 tr!("SyncApp.state.synced.title"),
-                // No system tray off Windows, so don't claim it runs "in the tray".
-                if cfg!(windows) {
-                    tr!("SyncApp.state.syncedIdle.body")
-                } else {
-                    tr!("SyncApp.state.syncedIdle.bodyLinux")
-                },
+                tr!("SyncApp.state.syncedIdle.body"),
             ),
             HubState::NeedsLauncher => (
                 tr!("SyncApp.state.needsLauncher.title", launcher => self.effective_platform().label()),
@@ -1021,20 +900,28 @@ impl ArcTrackerSyncApp {
             ),
             HubState::NeedsAttention => (
                 tr!("SyncApp.state.needsAttention.title"),
-                if self.npcap_known_missing() {
-                    tr!("SyncApp.state.needsAttention.npcapBody")
-                } else {
-                    tr!("SyncApp.state.needsAttention.body")
-                },
+                tr!("SyncApp.state.needsAttention.body"),
             ),
         }
     }
 
-    /// Local "Mon D, HH:MM" the current Embark session stays synced until,
-    /// decoded from the captured token's `exp`. `None` without a live token.
+    /// Local "HH:MM" that the current Embark session stays synced until, decoded
+    /// from the captured token's `exp`. `None` if there's no live token (or it
+    /// has already expired).
     fn session_expiry_label(&self) -> Option<String> {
         let exp = self.latest_token.as_ref()?.expires_at()?;
-        expiry_label(exp, chrono::Local::now())
+        let now = chrono::Local::now();
+        // Only surface a genuinely-future expiry; a near-now value is just the
+        // current token about to rotate and reads as "expires right now".
+        if exp <= now + chrono::Duration::minutes(2) {
+            return None;
+        }
+        let format = if exp.date_naive() == now.date_naive() {
+            "%H:%M"
+        } else {
+            "%b %-d, %H:%M"
+        };
+        Some(exp.format(format).to_string())
     }
 
     fn state_accent(state: HubState) -> Color32 {
@@ -1047,34 +934,7 @@ impl ArcTrackerSyncApp {
         }
     }
 
-    /// Which of the four stepper phases (0..=3)
-    fn hub_phase(state: HubState) -> usize {
-        match state {
-            HubState::NeedsAdmin | HubState::SignedOut | HubState::SigningIn => 0,
-            HubState::SelectGame
-            | HubState::PrepareLauncher
-            | HubState::PreparingLauncher
-            | HubState::CloseLauncher
-            | HubState::NeedsLauncher => 1,
-            HubState::LauncherReady | HubState::Connecting => 2,
-            HubState::Updating
-            | HubState::Synced
-            | HubState::SyncedIdle
-            | HubState::NeedsAttention => 3,
-        }
-    }
-
-    /// States that are actively waiting on background work
-    fn is_busy(state: HubState) -> bool {
-        matches!(
-            state,
-            HubState::SigningIn
-                | HubState::PreparingLauncher
-                | HubState::Connecting
-                | HubState::Updating
-        )
-    }
-
+    /// The 4-stage progress strip status (done / current / pending).
     fn progress_stages(&self, state: HubState) -> [(String, StageState); 4] {
         let signed_in = self.auth_token.is_some();
         let steam_ready = self.launcher_ready();
@@ -1122,7 +982,7 @@ impl ArcTrackerSyncApp {
         ]
     }
 
-    // ----- capture / launcher wiring -------------------------------------------------
+    // ----- existing wiring (preserved) ---------------------------------------------
 
     fn refresh_interfaces(&mut self) {
         let previous_name = self.selected_interface().map(|iface| iface.name.clone());
@@ -1163,20 +1023,15 @@ impl ArcTrackerSyncApp {
         let previous = self.sync_key_source.clone();
 
         match launch::resolve_current_sync_key_source() {
-            Ok(resolution) => {
-                self.sync_key_skipped = resolution.skipped.clone();
-                if previous.as_ref() == Some(&resolution.source) {
+            Ok(source) => {
+                if previous.as_ref() == Some(&source) {
                     return;
                 }
-                self.sync_key_source = Some(resolution.source.clone());
-                for skipped in &resolution.skipped {
-                    self.push_message(skipped_sync_key_notice(&skipped.path));
-                }
-                self.push_message(resolution.source.label().to_string());
+                self.sync_key_source = Some(source.clone());
+                self.push_message(source.label().to_string());
                 self.capture_settings_changed();
             }
             Err(error) => {
-                self.sync_key_skipped = Vec::new();
                 self.sync_key_source = None;
                 self.capture_settings_changed();
                 self.push_message(format!("Local sync setup unavailable: {error:#}"));
@@ -1212,29 +1067,6 @@ impl ArcTrackerSyncApp {
         }
     }
 
-    /// TTL-gated `Npcap::is_installed()` probe; only runs while the Npcap
-    /// capture method is selected. The 2s re-check means the "Npcap missing"
-    /// warnings clear on their own shortly after the user installs it.
-    fn refresh_npcap_available_if_needed(&mut self) {
-        if self.config.capture_method != CaptureMethod::Npcap {
-            return;
-        }
-        if self.npcap_available.is_some()
-            && self.last_npcap_check.elapsed() < Duration::from_secs(2)
-        {
-            return;
-        }
-        self.npcap_available = Some(Npcap::is_installed());
-        self.last_npcap_check = Instant::now();
-    }
-
-    /// True when the user selected Npcap but it is not installed — the one
-    /// capture-blocked cause the app can name precisely (detected by state,
-    /// never by parsing error strings).
-    fn npcap_known_missing(&self) -> bool {
-        self.config.capture_method == CaptureMethod::Npcap && self.npcap_available == Some(false)
-    }
-
     fn refresh_game_running(&mut self) {
         self.game_running = GAME_PROCESS_NAMES.iter().any(|name| {
             crate::process_env::find_processes(name)
@@ -1264,7 +1096,8 @@ impl ArcTrackerSyncApp {
         launch::resolve_platform(self.config.platform, self.selected_game_path().as_deref())
     }
 
-    /// States where offering a quick Steam|Epic switch makes sense.
+    /// Whether `state` is part of the launcher-prep phase, where offering a quick
+    /// Steam|Epic switch makes sense.
     fn is_launcher_phase(state: HubState) -> bool {
         matches!(
             state,
@@ -1289,23 +1122,27 @@ impl ArcTrackerSyncApp {
         }
     }
 
+    /// Right-aligned Steam|Epic segmented toggle for the hero card. The active
+    /// segment is the current launcher; clicking the other switches to it.
     fn launcher_toggle(&mut self, ui: &mut egui::Ui) {
         let current = self.effective_platform();
         let mut switch_to = None;
-        ui.horizontal(|ui| {
-            if launcher_segment(
-                ui,
-                LauncherPlatform::Steam.label(),
-                current == LauncherPlatform::Steam,
-            ) {
-                switch_to = Some(LauncherPlatform::Steam);
-            }
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            // right_to_left adds trailing-first, so place Epic then Steam to read
+            // "Steam | Epic" left-to-right.
             if launcher_segment(
                 ui,
                 LauncherPlatform::Epic.label(),
                 current == LauncherPlatform::Epic,
             ) {
                 switch_to = Some(LauncherPlatform::Epic);
+            }
+            if launcher_segment(
+                ui,
+                LauncherPlatform::Steam.label(),
+                current == LauncherPlatform::Steam,
+            ) {
+                switch_to = Some(LauncherPlatform::Steam);
             }
         });
         if let Some(platform) = switch_to.filter(|p| *p != current) {
@@ -1363,8 +1200,10 @@ impl ArcTrackerSyncApp {
         }
     }
 
-    /// Switching to Epic with no game path set auto-fills it from the Epic
-    /// manifests so the user isn't stuck on the "Choose ARC Raiders" picker.
+    /// Switch the active launcher (from Settings or the hub toggle). Switching to
+    /// Epic with no game path set auto-fills it from the Epic manifests (preferring
+    /// the install detected at startup) so it's immediately ready, not stuck on the
+    /// "Choose ARC Raiders" picker.
     fn set_launcher(&mut self, platform: LauncherPlatform) {
         self.config.platform = platform;
         self.force_close_available = false;
@@ -1464,6 +1303,7 @@ impl ArcTrackerSyncApp {
         self.sync_enabled = false;
         self.latest_token = None;
         self.account_name = None;
+        self.last_synced_label = None;
         self.update_tray_tooltip();
     }
 
@@ -1487,19 +1327,13 @@ impl ArcTrackerSyncApp {
         };
         let sync_key_path = sync_key_source.path;
 
-        // `is_file`, not `exists`: a directory path (e.g. a stale SSLKEYLOGFILE
-        // override) would open with "access denied" and block capture.
-        if !sync_key_path.is_file() {
+        if !sync_key_path.exists() {
             return;
         }
 
         self.stats = CaptureStats::default();
         self.latest_token = None;
-        self.capture = Some(capture::start_capture(
-            self.config.capture_method,
-            interface_name,
-            sync_key_path,
-        ));
+        self.capture = Some(capture::start_capture(interface_name, sync_key_path));
     }
 
     fn capture_settings_changed(&mut self) {
@@ -1513,7 +1347,6 @@ impl ArcTrackerSyncApp {
         self.token_submitted = false;
         self.submitted_token_fingerprint = None;
         self.sync_enabled = false;
-        self.reset_submit_retry_state();
     }
 
     fn poll_auth(&mut self) {
@@ -1566,9 +1399,6 @@ impl ArcTrackerSyncApp {
                     let was_synced = self.token_submitted;
                     self.latest_token = Some(observation);
                     if !already_submitted {
-                        // A genuinely new token gets a clean retry budget, and
-                        // resumes submission if a prior episode hard-stopped.
-                        self.reset_submit_retry_state();
                         if !was_synced {
                             self.token_submitted = false;
                             self.sync_enabled = false;
@@ -1604,8 +1434,6 @@ impl ArcTrackerSyncApp {
                     self.token_submitted = true;
                     self.submitted_token_fingerprint = Some(fingerprint);
                     self.sync_enabled = response.sync_enabled;
-                    self.last_sync_error = None;
-                    self.reset_submit_retry_state();
                     let account =
                         match (&response.display_name, &response.display_name_discriminator) {
                             (Some(name), Some(discriminator)) => format!("{name}#{discriminator}"),
@@ -1613,110 +1441,35 @@ impl ArcTrackerSyncApp {
                             _ => tr!("SyncApp.tray.tooltipIdle"),
                         };
                     self.account_name = Some(account.clone());
+                    self.last_synced_label = Some(current_time_label());
                     self.push_message(format!("{account} connected"));
                     self.update_tray_tooltip();
                     self.submit_latest_token_if_ready();
                 } else if !self.token_submitted {
                     self.sync_enabled = response.sync_enabled;
-                    // Authoritative server answer — no retry until a new token.
-                    self.last_sync_error = Some(
-                        "ARCTracker answered success=false for the submitted token".to_string(),
-                    );
-                    self.submit_failed_at = None;
                     self.push_message(
                         "ARCTracker did not enable sync for this account".to_string(),
                     );
                 }
             }
             Ok(Err(error)) => {
-                self.note_submit_failure(&error.to_string());
-                // A 401 means the ARCTracker sign-in may have expired: refresh
-                // once per failure episode and let that resubmit. Not on every
-                // 401 — a persistent server-side error masked as 401 (e.g. a
-                // stale Embark manifest) would loop refresh→resubmit→401 with
-                // no delay, hammering the backend.
-                if Self::is_auth_submission_error(&error) && !self.refreshed_for_current_failure {
+                if Self::is_auth_submission_error(&error) {
+                    // The 401 footgun fix: try a refresh before signing out.
                     if let Some(token) = self.auth_token.clone() {
-                        self.refreshed_for_current_failure = true;
                         self.refresh_after_unauthorized = true;
                         self.start_refresh(token);
                     } else {
                         self.clear_auth_session();
                     }
                 }
+                self.push_message(error.to_string());
             }
             Err(mpsc::TryRecvError::Empty) => {
                 self.submit_rx = Some(rx);
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.push_message("Submission worker stopped unexpectedly".to_string());
-                self.note_submit_failure("Submission worker stopped unexpectedly");
             }
-        }
-    }
-
-    /// Backoff delay after `failures` consecutive failed submissions; `None`
-    /// gives up for good, so an outage can't keep hammering the backend (and
-    /// Embark behind it).
-    fn submit_backoff(failures: u32) -> Option<Duration> {
-        match failures {
-            0 => None,
-            1 => Some(Duration::from_secs(30)),
-            2 => Some(Duration::from_secs(60)),
-            3 => Some(Duration::from_secs(120)),
-            4 => Some(Duration::from_secs(300)),
-            5 => Some(Duration::from_secs(600)),
-            _ => None,
-        }
-    }
-
-    /// The error is pushed to the log once per distinct message.
-    fn note_submit_failure(&mut self, error: &str) {
-        self.consecutive_submit_failures = self.consecutive_submit_failures.saturating_add(1);
-        let detail = Self::scrub_paths(error);
-        if self.last_sync_error.as_deref() != Some(detail.as_str()) {
-            self.push_message(error.to_string());
-        }
-        self.last_sync_error = Some(detail);
-
-        if Self::submit_backoff(self.consecutive_submit_failures).is_some() {
-            self.submit_failed_at = Some(Instant::now());
-        } else {
-            // Schedule exhausted — stop until the user acts or a new token arrives.
-            self.submit_failed_at = None;
-            self.submit_gave_up = true;
-            self.push_message(
-                "Sync paused after repeated failures. Use Try again once it's resolved."
-                    .to_string(),
-            );
-        }
-    }
-
-    fn reset_submit_retry_state(&mut self) {
-        self.consecutive_submit_failures = 0;
-        self.refreshed_for_current_failure = false;
-        self.submit_gave_up = false;
-        self.submit_failed_at = None;
-    }
-
-    /// Retry a failed submission once its backoff window elapses. Capture emits
-    /// each distinct token only once, so without this a transient blip would
-    /// lose sync for the whole session.
-    fn maybe_retry_token_submission(&mut self) {
-        if self.token_submitted || self.submit_rx.is_some() {
-            return;
-        }
-        let Some(failed_at) = self.submit_failed_at else {
-            return;
-        };
-        let Some(delay) = Self::submit_backoff(self.consecutive_submit_failures) else {
-            self.submit_failed_at = None;
-            self.submit_gave_up = true;
-            return;
-        };
-        if failed_at.elapsed() >= delay {
-            self.submit_failed_at = Some(Instant::now());
-            self.submit_latest_token_if_ready();
         }
     }
 
@@ -1738,7 +1491,6 @@ impl ArcTrackerSyncApp {
             return;
         }
 
-        self.submit_attempts += 1;
         let (tx, rx) = mpsc::channel();
         self.submit_rx = Some(rx);
         thread::spawn(move || {
@@ -1755,6 +1507,7 @@ impl ArcTrackerSyncApp {
         self.submitted_token_fingerprint = None;
         self.sync_enabled = false;
         self.account_name = None;
+        self.last_synced_label = None;
         if let Err(error) = credential_store::clear_auth_token() {
             self.push_message(format!("Could not clear ARCTracker sign-in: {error:#}"));
         }
@@ -1772,15 +1525,8 @@ impl ArcTrackerSyncApp {
 
     fn push_message(&mut self, message: String) {
         self.messages
-            .insert(0, Self::stored_event_message(&message));
+            .insert(0, Self::support_event_message(&message));
         self.messages.truncate(20);
-    }
-
-    /// What the activity log stores: the raw message with usernames scrubbed.
-    /// Keyword redaction happens at render time (`support_event_message`), so
-    /// the copied diagnostics keep full failure detail for support.
-    fn stored_event_message(message: &str) -> String {
-        Self::scrub_paths(message)
     }
 
     fn copy_diagnostics(&self, ctx: &egui::Context) {
@@ -1792,14 +1538,6 @@ impl ArcTrackerSyncApp {
             format!("Launcher detail: {}", self.launcher_readiness.detail),
             format!("Game running: {}", self.game_running),
             format!("Capture ready: {}", self.capture_ready()),
-            format!("Capture method: {}", self.config.capture_method.label()),
-            format!(
-                "Npcap: {}",
-                match Npcap::load() {
-                    Ok(npcap) => npcap.lib_version(),
-                    Err(_) => "not installed".to_string(),
-                }
-            ),
             format!("Account synced: {}", self.token_submitted),
             format!("Inventory sync enabled: {}", self.sync_enabled),
             format!("Connection active: {}", self.capture.is_some()),
@@ -1855,48 +1593,8 @@ impl ArcTrackerSyncApp {
                 "Packet truncations: {} ({} bytes)",
                 self.stats.packet_truncations, self.stats.packet_truncated_bytes
             ),
-            format!(
-                "Sync key source: {}",
-                self.sync_key_source
-                    .as_ref()
-                    .map(|source| format!("{:?} ({})", source.kind, source.path.display()))
-                    .unwrap_or_else(|| "-".to_string())
-            ),
-            format!("Sync key reloads: {}", self.stats.sync_key_reloads),
-            format!("Signed in: {}", self.auth_token.is_some()),
-            format!(
-                "Token host: {}",
-                self.latest_token
-                    .as_ref()
-                    .map(|token| token.host.as_str())
-                    .unwrap_or("-")
-            ),
-            format!(
-                "Sync submit attempts: {} (in flight: {})",
-                self.submit_attempts,
-                self.submit_rx.is_some()
-            ),
-            format!(
-                "Sync retry: {} consecutive failures{}",
-                self.consecutive_submit_failures,
-                if self.submit_gave_up {
-                    " (paused — Try again to resume)"
-                } else {
-                    ""
-                }
-            ),
-            format!(
-                "Last sync error: {}",
-                self.last_sync_error.as_deref().unwrap_or("-")
-            ),
+            "Events:".to_string(),
         ];
-        for skipped in &self.sync_key_skipped {
-            lines.push(format!(
-                "Skipped SSLKEYLOGFILE (not a file): {}",
-                skipped.path.display()
-            ));
-        }
-        lines.push("Events:".to_string());
         for message in &self.messages {
             lines.push(format!("  {message}"));
         }
@@ -1905,58 +1603,37 @@ impl ArcTrackerSyncApp {
         ctx.copy_text(Self::scrub_paths(&lines.join("\n")));
     }
 
-    /// What the on-screen activity log shows. The app's networking is described
-    /// openly (README, source), so the real event text is kept as-is — we only
-    /// redact the one genuine secret that could appear, the access-token value,
-    /// plus usernames in paths. Full detail still reaches "Copy diagnostics".
     fn support_event_message(message: &str) -> String {
-        Self::scrub_paths(&Self::redact_token_values(message))
-    }
-
-    /// Replace an access-token value with `<redacted>` wherever one could show
-    /// up — the value right after a `Bearer` marker, or a bare JWT-looking token
-    /// (three long base64url segments). Everything else, including mechanism
-    /// words like "TLS" or "keylog", is left intact.
-    fn redact_token_values(message: &str) -> String {
-        fn is_jwt_like(word: &str) -> bool {
-            let parts: Vec<&str> = word.split('.').collect();
-            parts.len() == 3
-                && parts.iter().all(|part| {
-                    part.len() >= 10
-                        && part
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                })
-        }
-
-        // After a `Bearer` marker, the next word is the secret value.
-        fn flush(word: &mut String, out: &mut String, after_marker: &mut bool) {
-            if word.is_empty() {
-                return;
-            }
-            if *after_marker || is_jwt_like(word) {
-                out.push_str("<redacted>");
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("authorization")
+            || lower.contains("bearer")
+            || lower.contains("token")
+            || lower.contains("http")
+            || lower.contains("tls")
+            || lower.contains("ssl")
+            || lower.contains("keylog")
+            || lower.contains("secret")
+            || lower.contains("random=")
+        {
+            return if lower.contains("fail")
+                || lower.contains("error")
+                || lower.contains("reject")
+                || lower.contains("unavailable")
+                || lower.contains("not readable")
+            {
+                "Local sync needs attention.".to_string()
             } else {
-                out.push_str(word);
-            }
-            let bare = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-            *after_marker = bare.eq_ignore_ascii_case("bearer");
-            word.clear();
+                "Local sync setup updated.".to_string()
+            };
         }
 
-        let mut out = String::with_capacity(message.len());
-        let mut word = String::new();
-        let mut after_marker = false;
-        for ch in message.chars() {
-            if ch.is_whitespace() {
-                flush(&mut word, &mut out, &mut after_marker);
-                out.push(ch);
-            } else {
-                word.push(ch);
-            }
-        }
-        flush(&mut word, &mut out, &mut after_marker);
-        out
+        let cleaned = message
+            .replace("capture", "connection")
+            .replace("Capture", "Connection")
+            .replace("adapter", "network option")
+            .replace("Adapter", "Network option")
+            .replace("Embark", "Game");
+        Self::scrub_paths(&cleaned)
     }
 
     /// Replace the username component in any `…\Users\<name>\…` path with
@@ -1983,10 +1660,8 @@ impl ArcTrackerSyncApp {
     }
 
     fn interface_label(interface: &InterfaceInfo) -> String {
-        // Show the friendly adapter name only; the raw interface name is a GUID
-        // (kept internally for selection) and is noise in the UI.
         match &interface.description {
-            Some(desc) if !desc.is_empty() => desc.clone(),
+            Some(desc) if !desc.is_empty() => format!("{desc} ({})", interface.name),
             _ => interface.name.clone(),
         }
     }
@@ -2008,27 +1683,6 @@ impl ArcTrackerSyncApp {
         .to_ascii_lowercase();
 
         let mut score = 0;
-
-        // Link state dominates: a down interface (e.g. unused Wi-Fi while on
-        // Ethernet) must never win over the live one. The Linux backend encodes
-        // this in the description as "link up" / "link down"; on Windows the
-        // adapter list is already up-only, so these simply don't match.
-        if text.contains("link up") {
-            score += 100;
-        }
-        if text.contains("link down") {
-            score -= 100;
-        }
-
-        // Linux interface-name prefixes (predictable names + legacy): wired
-        // en*/eth*, wireless wl*/wlan*. Without these, `enp7s0`/`wlan0` score 0
-        // and ties resolve to the last (often-down) interface.
-        for (prefix, bonus) in [("en", 20), ("eth", 20), ("wl", 15)] {
-            if interface.name.starts_with(prefix) {
-                score += bonus;
-            }
-        }
-
         for preferred in [
             "ethernet", "wi-fi", "wifi", "wireless", "gigabit", "realtek", "intel", "asix",
         ] {
@@ -2058,192 +1712,41 @@ impl ArcTrackerSyncApp {
 
     // ----- rendering ---------------------------------------------------------------
 
-    /// The hub body: a persistent stepper rail on the left and the active phase's
-    fn render_hub_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: HubState) {
-        let tone = Self::state_accent(state);
-        let busy = Self::is_busy(state);
-        let inner = ui
-            .max_rect()
-            .shrink2(vec2(theme::BODY_PAD_X, theme::BODY_PAD_Y));
-
-        let rail_h = 4.0 * theme::STEP_ROW_HEIGHT;
-        let pad_top = ((inner.height() - rail_h) / 2.0).max(0.0);
-        let top = inner.top() + pad_top;
-
-        let rail_rect =
-            Rect::from_min_size(pos2(inner.left(), top), vec2(theme::RAIL_WIDTH, rail_h));
-        let divider_x = inner.left() + theme::RAIL_WIDTH + theme::COLUMN_GAP / 2.0;
-        let hero_left = inner.left() + theme::RAIL_WIDTH + theme::COLUMN_GAP;
-        // The hero spans the full body height (not the rail's centered band) so
-        // tall states (e.g. Synced) have room; its content is centered within.
-        let hero_rect = Rect::from_min_max(pos2(hero_left, inner.top()), inner.right_bottom());
-
-        // Full-height divider (matching the design), not just the rail's band.
-        ui.painter().vline(
-            divider_x,
-            (inner.top() + 6.0)..=(inner.bottom() - 6.0),
-            Stroke::new(1.0, arc_border_soft()),
-        );
-
-        // Left rail: the four-phase stepper. progress_stages() supplies each
-        let stages = self.progress_stages(state);
-        let labels = phase_node_labels(self.effective_platform().label());
-        let nodes = [
-            StepperNode {
-                number: 1,
-                label: &labels[0].0,
-                sub: &labels[0].1,
-                state: stages[0].1,
-            },
-            StepperNode {
-                number: 2,
-                label: &labels[1].0,
-                sub: &labels[1].1,
-                state: stages[1].1,
-            },
-            StepperNode {
-                number: 3,
-                label: &labels[2].0,
-                sub: &labels[2].1,
-                state: stages[2].1,
-            },
-            StepperNode {
-                number: 4,
-                label: &labels[3].0,
-                sub: &labels[3].1,
-                state: stages[3].1,
-            },
-        ];
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(rail_rect)
-                .layout(Layout::top_down(Align::Min)),
-            |ui| vertical_stepper(ui, &nodes, tone, busy),
-        );
-
-        // Right panel: active phase detail + actions
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(hero_rect)
-                .layout(Layout::top_down(Align::Min)),
-            |ui| self.hero_panel(ui, ctx, state),
-        );
+    fn render_hub(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let state = self.hub_state();
+        self.render_header(ui);
+        ui.add_space(16.0);
+        self.render_progress_strip(ui, state);
+        ui.add_space(14.0);
+        self.render_hero(ui, ctx, state);
+        ui.add_space(12.0);
+        self.render_footer(ui);
+        self.render_explainer_modal(ctx);
+        self.render_update_modal(ctx);
     }
 
-    fn hero_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: HubState) {
-        let (title, body) = self.hub_copy(state);
-        let tone = Self::state_accent(state);
-        let phase = Self::hub_phase(state);
-        let busy = Self::is_busy(state);
-        let phase_name = phase_node_labels(self.effective_platform().label())[phase]
-            .0
-            .clone();
-
-        // Center the content vertically within the hero column. egui can't
-        // measure ahead in immediate mode, so reuse last frame's height (stable
-        // per state; one frame settles after a state change).
-        let avail_h = ui.max_rect().height();
-        let offset = ((avail_h - self.hero_content_height) / 2.0).max(0.0);
-        ui.add_space(offset);
-        let used = ui
-            .scope(|ui| {
-                ui.horizontal(|ui| {
-                    // Icon tile and eyebrow share one centered row (gap 11px),
-                    // matching the design's [tile | "<PHASE> · STEP n OF 4"].
-                    ui.spacing_mut().item_spacing.x = 11.0;
-                    icon_tile(ui, phase, tone, busy);
-                    mono_eyebrow(
-                        ui,
-                        &format!(
-                            "{} · {}",
-                            phase_name,
-                            tr!("SyncApp.hero.step", n => (phase + 1).to_string())
-                        ),
-                        tone,
-                    );
-                });
-                ui.add_space(theme::SPACE_LG);
-                ui.label(
-                    RichText::new(title)
-                        .size(theme::TEXT_HUB_TITLE)
-                        .color(arc_foreground()),
-                );
-                ui.add_space(theme::SPACE_SM);
-                ui.label(
-                    RichText::new(body)
-                        .size(theme::TEXT_HERO_BODY)
-                        .color(arc_muted_text()),
-                );
-
-                if Self::is_launcher_phase(state) && self.launcher_switch_target().is_some() {
-                    ui.add_space(theme::SPACE_MD);
-                    self.launcher_toggle(ui);
-                }
-
-                if state == HubState::Synced {
-                    if let Some(until) = self.session_expiry_label() {
-                        ui.add_space(theme::SPACE_MD);
-                        tone_card(ui, arc_success(), |ui| {
-                            ui.horizontal(|ui| {
-                                inline_check(ui, arc_success());
-                                ui.add_space(theme::SPACE_SM);
-                                ui.label(
-                                    RichText::new(
-                                        tr!("SyncApp.state.synced.session", time => until),
-                                    )
-                                    .size(theme::TEXT_SECONDARY)
-                                    .strong()
-                                    .color(arc_foreground()),
-                                );
-                            });
-                        });
-                    }
-                    ui.add_space(theme::SPACE_SM);
-                    ui.label(
-                        RichText::new(if cfg!(windows) {
-                            tr!("SyncApp.state.synced.canClose")
-                        } else {
-                            // Closing quits on Linux (no tray to hide into).
-                            tr!("SyncApp.state.synced.canCloseLinux")
-                        })
-                        .size(theme::TEXT_SECONDARY)
-                        .color(arc_muted_text()),
-                    );
-                }
-
-                ui.add_space(theme::SPACE_XL + 2.0);
-                self.render_hero_actions(ui, ctx, state);
-            })
-            .response
-            .rect
-            .height();
-        self.hero_content_height = used;
-    }
-
+    /// Bundled, localized, launcher-aware explanation shown when the user clicks
+    /// "What does this do?" — replaces the old jump to the website.
     fn render_explainer_modal(&mut self, ctx: &egui::Context) {
         if !self.show_explainer {
             return;
         }
         let launcher = self.effective_platform().label();
-        let modal = arc_modal("arc_explainer").show(ctx, |ui| {
-            ui.set_max_width(theme::MODAL_WIDTH);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = theme::SPACE_MD;
-                refresh_badge(ui);
-                ui.label(
-                    RichText::new(tr!("SyncApp.explain.title", launcher => launcher))
-                        .size(theme::TEXT_SUBTITLE)
-                        .strong()
-                        .color(arc_foreground()),
-                );
-            });
-            ui.add_space(theme::SPACE_LG);
+        let modal = egui::Modal::new(egui::Id::new("arc_explainer")).show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            ui.label(
+                RichText::new(tr!("SyncApp.explain.title", launcher => launcher))
+                    .size(18.0)
+                    .strong()
+                    .color(arc_foreground()),
+            );
+            ui.add_space(10.0);
             ui.label(
                 RichText::new(tr!("SyncApp.explain.body", launcher => launcher))
-                    .size(theme::TEXT_SECONDARY)
+                    .size(13.5)
                     .color(arc_muted_text()),
             );
-            ui.add_space(theme::SPACE_LG);
+            ui.add_space(18.0);
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if primary_button(ui, &tr!("SyncApp.action.gotIt")) {
                     self.show_explainer = false;
@@ -2255,7 +1758,10 @@ impl ArcTrackerSyncApp {
         }
     }
 
-    /// Changelog + install dialog
+    /// The changelog + install dialog. Renders the current `update_state`: the
+    /// changelog with Install/Later, a progress bar while downloading, a spinner
+    /// while verifying/installing/restarting, or an error with Retry. It cannot
+    /// be dismissed once an install is under way.
     fn render_update_modal(&mut self, ctx: &egui::Context) {
         if !self.show_update_modal {
             return;
@@ -2265,8 +1771,8 @@ impl ArcTrackerSyncApp {
         let mut install_clicked = false;
         let mut close_clicked = false;
 
-        let modal = arc_modal("arc_update").show(ctx, |ui| {
-            ui.set_max_width(theme::MODAL_WIDTH);
+        let modal = egui::Modal::new(egui::Id::new("arc_update")).show(ctx, |ui| {
+            ui.set_max_width(480.0);
             match &state {
                 UpdateState::Available | UpdateState::Failed(_) => {
                     let Some(release) = release.as_ref() else {
@@ -2275,18 +1781,18 @@ impl ArcTrackerSyncApp {
                     };
                     ui.label(
                         RichText::new(tr!("SyncApp.update.title", version => release.tag.clone()))
-                            .size(theme::TEXT_SUBTITLE)
+                            .size(18.0)
                             .strong()
                             .color(arc_foreground()),
                     );
-                    ui.add_space(theme::SPACE_MD);
+                    ui.add_space(10.0);
                     ui.label(
                         RichText::new(tr!("SyncApp.update.changelogHeading"))
-                            .size(theme::TEXT_SECONDARY)
+                            .size(13.0)
                             .strong()
                             .color(arc_primary()),
                     );
-                    ui.add_space(theme::SPACE_SM);
+                    ui.add_space(6.0);
                     egui::ScrollArea::vertical()
                         .max_height(260.0)
                         .auto_shrink([false, true])
@@ -2294,21 +1800,21 @@ impl ArcTrackerSyncApp {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(release.notes.as_str())
-                                        .size(theme::TEXT_SECONDARY)
+                                        .size(13.0)
                                         .color(arc_muted_text()),
                                 )
                                 .selectable(true),
                             );
                         });
                     if let UpdateState::Failed(error) = &state {
-                        ui.add_space(theme::SPACE_MD);
+                        ui.add_space(10.0);
                         ui.label(
                             RichText::new(tr!("SyncApp.update.failed", error => error.clone()))
-                                .size(theme::TEXT_SECONDARY)
+                                .size(12.5)
                                 .color(arc_warning()),
                         );
                     }
-                    ui.add_space(theme::SPACE_LG);
+                    ui.add_space(16.0);
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         let install_label = if matches!(state, UpdateState::Failed(_)) {
                             tr!("SyncApp.update.retry")
@@ -2326,11 +1832,11 @@ impl ArcTrackerSyncApp {
                 UpdateState::Downloading { received, total } => {
                     ui.label(
                         RichText::new(tr!("SyncApp.update.downloading"))
-                            .size(theme::TEXT_SUBTITLE)
+                            .size(16.0)
                             .strong()
                             .color(arc_foreground()),
                     );
-                    ui.add_space(theme::SPACE_MD);
+                    ui.add_space(12.0);
                     match total {
                         Some(total) if *total > 0 => {
                             let fraction = (*received as f32 / *total as f32).clamp(0.0, 1.0);
@@ -2365,81 +1871,16 @@ impl ArcTrackerSyncApp {
         }
     }
 
-    /// The ARC chevron mark (32×32, baked by `build.rs`), uploaded once on
-    /// first use.
-    fn arc_mark(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
-        self.mark_texture
-            .get_or_insert_with(|| {
-                const RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon_32.rgba"));
-                let image = egui::ColorImage::from_rgba_unmultiplied([32, 32], RGBA);
-                ctx.load_texture("arc-mark", image, egui::TextureOptions::LINEAR)
-            })
-            .clone()
-    }
-
-    /// Optional update pill and the minimize / maximize / close
-    fn render_title_bar(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        rect: Rect,
-        maximized: bool,
-    ) {
-        let mark = self.arc_mark(ctx);
-        let signed_in = self.auth_token.is_some();
-        let update_visible = self.update_indicator_visible();
-        let window_r = if maximized { 0 } else { theme::RADIUS_WINDOW };
-
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius {
-                nw: window_r,
-                ne: window_r,
-                sw: 0,
-                se: 0,
-            },
-            arc_titlebar(),
-        );
-        ui.painter().hline(
-            rect.x_range(),
-            rect.bottom() - 0.5,
-            Stroke::new(1.0, arc_border_soft()),
-        );
-
-        let drag = ui.interact(
-            rect,
-            egui::Id::new("arc_titlebar_drag"),
-            Sense::click_and_drag(),
-        );
-        if drag.drag_started() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-        if drag.double_clicked() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-        }
-
-        let inner = Rect::from_min_max(
-            pos2(rect.left() + 12.0, rect.top()),
-            pos2(rect.right() - 8.0, rect.bottom()),
-        );
-        let mut open_update = false;
-        let mut minimize = false;
-        let mut toggle_max = false;
-        let mut close = false;
-
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(inner)
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                ui.image((mark.id(), vec2(19.0, 19.0)));
-                ui.add_space(theme::SPACE_SM);
-                ui.label(
-                    RichText::new(tr!("SyncApp.appName"))
-                        .size(13.0)
-                        .color(arc_foreground()),
-                );
-                ui.add_space(theme::SPACE_SM);
+    fn render_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(tr!("SyncApp.appName"))
+                    .size(20.0)
+                    .strong()
+                    .color(arc_foreground()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                let signed_in = self.auth_token.is_some();
                 pill(
                     ui,
                     &if signed_in {
@@ -2453,56 +1894,88 @@ impl ArcTrackerSyncApp {
                         arc_muted_text()
                     },
                 );
+                if self.update_indicator_visible() {
+                    ui.add_space(6.0);
+                    if clickable_pill(ui, &tr!("SyncApp.update.pill"), arc_primary()).clicked() {
+                        self.show_update_modal = true;
+                    }
+                }
+            });
+        });
+    }
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if window_button(ui, WindowButton::Close) {
-                        close = true;
-                    }
-                    let max_kind = if maximized {
-                        WindowButton::Restore
-                    } else {
-                        WindowButton::Maximize
-                    };
-                    if window_button(ui, max_kind) {
-                        toggle_max = true;
-                    }
-                    if window_button(ui, WindowButton::Minimize) {
-                        minimize = true;
-                    }
-                    if update_visible {
-                        ui.add_space(theme::SPACE_SM);
-                        if clickable_pill(ui, &tr!("SyncApp.update.pill"), arc_primary()).clicked()
-                        {
-                            open_update = true;
+    fn render_progress_strip(&mut self, ui: &mut egui::Ui, state: HubState) {
+        let stages = self.progress_stages(state);
+        Frame::NONE
+            .fill(arc_card())
+            .stroke(Stroke::new(1.0, arc_border()))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let count = stages.len();
+                    for (index, (label, stage_state)) in stages.into_iter().enumerate() {
+                        progress_stage(ui, &label, stage_state);
+                        if index + 1 < count {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("›").size(14.0).color(arc_muted_text()));
+                            ui.add_space(6.0);
                         }
                     }
                 });
-            },
-        );
+            });
+    }
 
-        if open_update {
-            self.show_update_modal = true;
-        }
-        if minimize {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        }
-        if toggle_max {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-        }
-        if close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
+    fn render_hero(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: HubState) {
+        let (title, body) = self.hub_copy(state);
+        let accent = Self::state_accent(state);
+
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                status_dot(ui, accent);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(title)
+                        .size(22.0)
+                        .strong()
+                        .color(arc_foreground()),
+                );
+                // Quick Steam|Epic switch, only in the launcher phase and only when
+                // the other store also has the game.
+                if Self::is_launcher_phase(state) && self.launcher_switch_target().is_some() {
+                    self.launcher_toggle(ui);
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new(body).size(14.0).color(arc_muted_text()));
+
+            if state == HubState::Synced {
+                if let Some(until) = self.session_expiry_label() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(tr!("SyncApp.state.synced.session", time => until))
+                            .size(13.5)
+                            .strong()
+                            .color(arc_foreground()),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(tr!("SyncApp.state.synced.canClose"))
+                        .size(12.5)
+                        .color(arc_muted_text()),
+                );
+            }
+
+            ui.add_space(18.0);
+            self.render_hero_actions(ui, ctx, state);
+        });
     }
 
     fn render_hero_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: HubState) {
         ui.horizontal(|ui| match state {
             HubState::NeedsAdmin => {
-                let elevate_label = if cfg!(windows) {
-                    tr!("SyncApp.action.restartAsAdmin")
-                } else {
-                    tr!("SyncApp.action.grantCapture")
-                };
-                if primary_button(ui, &elevate_label) {
+                if primary_button(ui, &tr!("SyncApp.action.restartAsAdmin")) {
                     match elevation::relaunch_elevated() {
                         Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                         Err(error) => self.push_message(format!("{error:#}")),
@@ -2542,10 +2015,7 @@ impl ArcTrackerSyncApp {
                 }
             }
             HubState::PreparingLauncher => {
-                spinner_row(
-                    ui,
-                    &tr!("SyncApp.state.preparingLauncher.waiting", launcher => self.effective_platform().label()),
-                );
+                ui.spinner();
             }
             HubState::CloseLauncher => {
                 if primary_button(
@@ -2556,25 +2026,15 @@ impl ArcTrackerSyncApp {
                 }
             }
             HubState::LauncherReady => {
-                if self.tray.is_some()
-                    && secondary_button(ui, &tr!("SyncApp.action.hideToTray"))
-                {
+                if secondary_button(ui, &tr!("SyncApp.action.hideToTray")) {
                     self.hide_to_tray(ctx);
                 }
             }
-            HubState::Connecting => {
-                spinner_row(ui, &tr!("SyncApp.state.connecting.waiting"));
-            }
-            HubState::Updating => {
-                spinner_row(ui, &tr!("SyncApp.state.updating.waiting"));
+            HubState::Connecting | HubState::Updating => {
+                ui.spinner();
             }
             HubState::Synced | HubState::SyncedIdle => {
-                if primary_button(ui, &tr!("SyncApp.action.viewStash")) {
-                    let _ = auth_bridge::open_browser(STASH_URL);
-                }
-                if self.tray.is_some()
-                    && secondary_button(ui, &tr!("SyncApp.action.hideToTray"))
-                {
+                if secondary_button(ui, &tr!("SyncApp.action.hideToTray")) {
                     self.hide_to_tray(ctx);
                 }
             }
@@ -2590,21 +2050,11 @@ impl ArcTrackerSyncApp {
                 }
             }
             HubState::NeedsAttention => {
-                if self.npcap_known_missing() {
-                    ui.hyperlink_to(tr!("SyncApp.settings.npcapLink"), NPCAP_URL);
-                    ui.add_space(4.0);
-                }
                 if primary_button(ui, &tr!("SyncApp.action.tryAgain")) {
                     self.capture_blocked = false;
-                    // Re-probe for Npcap in case the user just installed it.
-                    self.npcap_available = None;
-                    // Resume submission if a prior episode hard-stopped, then
-                    // re-attempt with the token we already have.
-                    self.reset_submit_retry_state();
                     self.refresh_interfaces();
                     self.refresh_sync_key_source();
                     self.maybe_start_background_capture();
-                    self.submit_latest_token_if_ready();
                 }
                 if secondary_button(ui, &tr!("SyncApp.action.getHelp")) {
                     let _ = auth_bridge::open_browser(HELP_URL);
@@ -2613,187 +2063,68 @@ impl ArcTrackerSyncApp {
         });
     }
 
-    /// The shared 52px footer: a status dot + identity line, with the settings gear
-    fn render_footer(&mut self, ui: &mut egui::Ui, rect: Rect, maximized: bool) {
-        let window_r = if maximized { 0 } else { theme::RADIUS_WINDOW };
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius {
-                nw: 0,
-                ne: 0,
-                sw: window_r,
-                se: window_r,
-            },
-            arc_titlebar(),
-        );
-        ui.painter().hline(
-            rect.x_range(),
-            rect.top() + 0.5,
-            Stroke::new(1.0, arc_border_soft()),
-        );
+    fn render_footer(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let identity = match &self.account_name {
+                Some(account) if self.token_submitted => {
+                    tr!("SyncApp.footer.signedInAs", account => account)
+                }
+                _ if self.auth_token.is_some() => tr!("SyncApp.header.signedIn"),
+                _ => tr!("SyncApp.footer.notSignedIn"),
+            };
+            ui.label(RichText::new(identity).size(12.0).color(arc_muted_text()));
 
-        let (dot_color, job) = self.footer_identity();
-        let inner = Rect::from_min_max(
-            pos2(rect.left() + theme::BODY_PAD_X, rect.top()),
-            pos2(rect.right() - 10.0, rect.bottom()),
-        );
-        let mut open_settings = false;
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(inner)
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                // Draw the dot + identity as one unit, aligning the dot to the
-                // text's actual ink center.
-                let galley = ui.painter().layout_job(job);
-                let dot = 7.0;
-                let gap = theme::SPACE_SM;
-                let (id_rect, _) = ui.allocate_exact_size(
-                    vec2(dot + gap + galley.size().x, galley.size().y.max(dot)),
-                    Sense::hover(),
-                );
-                let text_top = id_rect.center().y - galley.size().y / 2.0;
-                let ink_center_y = text_top + galley.mesh_bounds.center().y;
-                ui.painter().circle_filled(
-                    pos2(id_rect.left() + dot / 2.0, ink_center_y),
-                    3.5,
-                    dot_color,
-                );
-                ui.painter().galley(
-                    pos2(id_rect.left() + dot + gap, text_top),
-                    galley,
-                    arc_muted_text(),
-                );
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.screen == Screen::Hub
-                        && settings_button(ui, &tr!("SyncApp.footer.settings"))
-                    {
-                        open_settings = true;
-                    }
-                });
-            },
-        );
-        if open_settings {
-            self.screen = Screen::Settings;
-        }
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if link_button(ui, &tr!("SyncApp.footer.settings")) {
+                    self.screen = Screen::Settings;
+                }
+            });
+        });
     }
 
-    /// Footer status dot color + identity text (the account is emphasized). The
-    /// identity is a `LayoutJob` so the dot can be aligned to its ink center.
-    fn footer_identity(&self) -> (Color32, egui::text::LayoutJob) {
-        use egui::text::{LayoutJob, TextFormat};
-        let font = egui::FontId::proportional(theme::TEXT_FOOTER);
-        let mut job = LayoutJob::default();
-        if self.token_submitted {
-            if let Some(account) = self.account_name.as_deref() {
-                job.append(
-                    &tr!("SyncApp.footer.syncedLabel"),
-                    0.0,
-                    TextFormat {
-                        font_id: font.clone(),
-                        color: arc_muted_text(),
-                        ..Default::default()
-                    },
-                );
-                job.append(
-                    &format!(" {account}"),
-                    0.0,
-                    TextFormat {
-                        font_id: font,
-                        color: arc_foreground(),
-                        ..Default::default()
-                    },
-                );
-                return (arc_success(), job);
+    fn render_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            if link_button(ui, "←") {
+                self.screen = Screen::Hub;
             }
-        }
-        let (color, text) = if self.auth_token.is_some() {
-            (arc_muted_text(), tr!("SyncApp.header.signedIn"))
-        } else {
-            (arc_fg_dim(), tr!("SyncApp.footer.notSignedIn"))
-        };
-        job.append(
-            &text,
-            0.0,
-            TextFormat {
-                font_id: font,
-                color,
-                ..Default::default()
-            },
-        );
-        (color, job)
-    }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(tr!("SyncApp.settings.title"))
+                    .size(20.0)
+                    .strong()
+                    .color(arc_foreground()),
+            );
+        });
+        ui.add_space(14.0);
 
-    /// The settings body: width-capped, scrollable stack of grouped cards
-    fn render_settings_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // The scroll area spans the full body width so its scrollbar hugs the
-        // window's right edge (matching the design); the cards are inset with a
-        // horizontal frame margin instead of by shrinking the scroll region.
-        let pad = theme::BODY_PAD_X;
-        let body = ui.max_rect();
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(body)
-                .layout(Layout::top_down(Align::Min)),
-            |ui| {
-                // Fixed header: back button + "Settings" title (the back
-                // affordance lives here rather than in the title bar).
-                ui.add_space(theme::BODY_PAD_Y);
-                ui.horizontal(|ui| {
-                    ui.add_space(pad);
-                    ui.spacing_mut().item_spacing.x = theme::SPACE_MD;
-                    if back_button(ui) {
-                        self.screen = Screen::Hub;
-                    }
-                    ui.label(
-                        RichText::new(tr!("SyncApp.settings.title"))
-                            .size(theme::TEXT_SUBTITLE)
-                            .strong()
-                            .color(arc_foreground()),
-                    );
-                });
-                ui.add_space(theme::SPACE_MD);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            self.render_settings_account(ui);
+            ui.add_space(10.0);
+            self.render_settings_game(ui);
+            ui.add_space(10.0);
+            self.render_settings_startup(ui);
+            ui.add_space(10.0);
+            self.render_settings_language(ui, ctx);
+            ui.add_space(10.0);
+            self.render_settings_network(ui);
+            ui.add_space(10.0);
+            self.render_settings_troubleshooting(ui, ctx);
+            ui.add_space(14.0);
+            self.render_settings_footer(ui);
+            ui.add_space(14.0);
+            if secondary_button(ui, &tr!("SyncApp.tray.quit")) {
+                self.quit();
+            }
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .scroll_source(egui::containers::scroll_area::ScrollSource {
-                        drag: false,
-                        ..Default::default()
-                    })
-                    .show(ui, |ui| {
-                        Frame::NONE
-                            .inner_margin(egui::Margin::symmetric(pad as i8, 0))
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                self.render_settings_account(ui);
-                                ui.add_space(theme::SPACE_MD);
-                                self.render_settings_game(ui);
-                                ui.add_space(theme::SPACE_MD);
-                                self.render_settings_startup(ui);
-                                ui.add_space(theme::SPACE_MD);
-                                self.render_settings_language(ui, ctx);
-                                ui.add_space(theme::SPACE_MD);
-                                self.render_settings_network(ui);
-                                ui.add_space(theme::SPACE_MD);
-                                self.render_settings_troubleshooting(ui, ctx);
-                                ui.add_space(theme::SPACE_LG);
-                                self.render_settings_footer(ui);
-                                ui.add_space(theme::SPACE_LG);
-                                if secondary_button_full(ui, &tr!("SyncApp.settings.quit")) {
-                                    self.quit();
-                                }
-                                // Breathing room below the last card so the
-                                // scroll doesn't end flush against the footer.
-                                ui.add_space(theme::SPACE_SM);
-                            });
-                    });
-            },
-        );
+            if self.show_activity_log {
+                ui.add_space(12.0);
+                self.render_activity_log(ui);
+            }
+        });
     }
 
     fn render_settings_account(&mut self, ui: &mut egui::Ui) {
-        settings_card(ui, &tr!("SyncApp.settings.account"), |ui| {
+        settings_section(ui, &tr!("SyncApp.settings.account"), |ui| {
             let account = self
                 .account_name
                 .clone()
@@ -2806,24 +2137,29 @@ impl ArcTrackerSyncApp {
                         tr!("SyncApp.footer.notSignedIn")
                     }
                 });
-            settings_row(ui, &account, &tr!("SyncApp.settings.staysSignedIn"), |ui| {
-                if ui
-                    .add_enabled(
-                        self.auth_token.is_some(),
-                        egui::Button::new(tr!("SyncApp.settings.signOut")),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    self.sign_out();
-                }
-            });
+            ui.label(RichText::new(account).color(arc_foreground()));
+            ui.label(
+                RichText::new(tr!("SyncApp.settings.staysSignedIn"))
+                    .size(12.0)
+                    .color(arc_muted_text()),
+            );
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(
+                    self.auth_token.is_some(),
+                    egui::Button::new(tr!("SyncApp.settings.signOut")),
+                )
+                .clicked()
+            {
+                self.sign_out();
+            }
         });
     }
 
     fn render_settings_game(&mut self, ui: &mut egui::Ui) {
-        settings_card(ui, &tr!("SyncApp.settings.gameLauncher"), |ui| {
-            settings_row(ui, &tr!("SyncApp.settings.launcher"), "", |ui| {
+        settings_section(ui, &tr!("SyncApp.settings.gameLauncher"), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(tr!("SyncApp.settings.launcher")).color(arc_foreground()));
                 let mut platform = self.config.platform;
                 egui::ComboBox::from_id_salt("settings_platform_combo")
                     .selected_text(platform.label())
@@ -2832,24 +2168,25 @@ impl ArcTrackerSyncApp {
                         ui.selectable_value(&mut platform, LauncherPlatform::Steam, "Steam");
                         ui.selectable_value(&mut platform, LauncherPlatform::Epic, "Epic Games");
                         ui.selectable_value(&mut platform, LauncherPlatform::Direct, "Direct");
-                    })
-                    .response
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    });
                 if platform != self.config.platform {
                     self.set_launcher(platform);
                 }
             });
-            hairline(ui);
-            let location = self
-                .selected_game_path()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| tr!("SyncApp.settings.autoDetected"));
-            settings_row(ui, &tr!("SyncApp.settings.arcLocation"), &location, |ui| {
-                if ui
-                    .button(tr!("SyncApp.settings.change"))
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(tr!("SyncApp.settings.arcLocation")).color(arc_foreground()),
+                    );
+                    let location = self
+                        .selected_game_path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| tr!("SyncApp.settings.autoDetected"));
+                    ui.label(RichText::new(location).size(12.0).color(arc_muted_text()));
+                });
+                if ui.button(tr!("SyncApp.settings.change")).clicked() {
                     self.browse_game_executable();
                 }
             });
@@ -2857,256 +2194,165 @@ impl ArcTrackerSyncApp {
     }
 
     fn render_settings_startup(&mut self, ui: &mut egui::Ui) {
-        // The only startup option is "keep running in the tray", which is a
-        // no-op off Windows (no tray; closing the window quits). Hide the card.
-        if !cfg!(windows) {
-            return;
-        }
-        settings_card(ui, &tr!("SyncApp.settings.startup"), |ui| {
+        settings_section(ui, &tr!("SyncApp.settings.startup"), |ui| {
+            let mut start_with_windows = self.config.start_with_windows;
+            if toggle_row(
+                ui,
+                &tr!("SyncApp.settings.startWithWindows"),
+                &tr!("SyncApp.settings.startWithWindowsSub"),
+                &mut start_with_windows,
+            ) {
+                match tray::set_start_with_windows(start_with_windows) {
+                    Ok(()) => {
+                        self.config.start_with_windows = start_with_windows;
+                        self.save_config();
+                    }
+                    Err(error) => self.push_message(format!("{error:#}")),
+                }
+            }
+
+            ui.add_space(6.0);
             let mut keep_in_tray = self.config.keep_in_tray;
-            settings_row(
+            if toggle_row(
                 ui,
                 &tr!("SyncApp.settings.keepInTray"),
                 &tr!("SyncApp.settings.keepInTraySub"),
-                |ui| {
-                    if toggle_switch(ui, &mut keep_in_tray) {
-                        self.config.keep_in_tray = keep_in_tray;
-                        self.save_config();
-                    }
-                },
-            );
+                &mut keep_in_tray,
+            ) {
+                self.config.keep_in_tray = keep_in_tray;
+                self.save_config();
+            }
         });
     }
 
     fn render_settings_language(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // The default tracks the OS UI language; name the OS for the platform.
-        let (matches_default, match_default) = if cfg!(windows) {
-            (
-                tr!("SyncApp.settings.matchesWindows"),
-                tr!("SyncApp.settings.matchWindows"),
-            )
-        } else {
-            (
-                tr!("SyncApp.settings.matchesSystem"),
-                tr!("SyncApp.settings.matchSystem"),
-            )
-        };
-        settings_card(ui, &tr!("SyncApp.settings.language"), |ui| {
-            settings_row(
-                ui,
-                &tr!("SyncApp.settings.displayLanguage"),
-                &matches_default,
-                |ui| {
-                    let current_label = match self.config.language.as_deref() {
-                        Some(code) => i18n::native_name(code).to_string(),
-                        None => match_default.clone(),
-                    };
-                    let mut chosen: Option<Option<String>> = None;
+        settings_section(ui, &tr!("SyncApp.settings.language"), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(tr!("SyncApp.settings.displayLanguage")).color(arc_foreground()),
+                );
 
-                    let combo = egui::ComboBox::from_id_salt("settings_language_combo")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
+                let current_label = match self.config.language.as_deref() {
+                    Some(code) => i18n::native_name(code).to_string(),
+                    None => tr!("SyncApp.settings.matchesWindows"),
+                };
+                let mut chosen: Option<Option<String>> = None;
+
+                egui::ComboBox::from_id_salt("settings_language_combo")
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                self.config.language.is_none(),
+                                tr!("SyncApp.settings.matchesWindows"),
+                            )
+                            .clicked()
+                        {
+                            chosen = Some(None);
+                        }
+                        for locale in i18n::UI_LOCALES.iter().copied() {
+                            let selected = self.config.language.as_deref() == Some(locale);
                             if ui
-                                .selectable_label(self.config.language.is_none(), &match_default)
+                                .selectable_label(selected, i18n::native_name(locale))
                                 .clicked()
                             {
-                                chosen = Some(None);
+                                chosen = Some(Some(locale.to_string()));
                             }
-                            for locale in i18n::UI_LOCALES.iter().copied() {
-                                let selected = self.config.language.as_deref() == Some(locale);
-                                if ui
-                                    .selectable_label(selected, i18n::native_name(locale))
-                                    .clicked()
-                                {
-                                    chosen = Some(Some(locale.to_string()));
-                                }
-                            }
-                        });
-                    combo
-                        .response
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        }
+                    });
 
-                    // The popup is open this frame (the menu closure ran), so
-                    // pull in the CJK fonts the native-name list needs.
-                    if combo.inner.is_some() {
-                        self.ensure_picker_fonts(ctx);
-                    }
-
-                    if let Some(language) = chosen {
-                        self.change_language(ctx, language);
-                    }
-                },
-            );
+                if let Some(language) = chosen {
+                    self.change_language(ctx, language);
+                }
+            });
         });
     }
 
     fn render_settings_network(&mut self, ui: &mut egui::Ui) {
-        settings_card(ui, &tr!("SyncApp.settings.network"), |ui| {
-            let selected_label = self
-                .selected_interface()
-                .map(Self::interface_label)
-                .unwrap_or_else(|| "Automatic".to_string());
-            let mut selected_name = None;
-            let mut refresh = false;
+        settings_section(ui, &tr!("SyncApp.settings.network"), |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(tr!("SyncApp.settings.networkAdapter"))
+                            .color(arc_foreground()),
+                    );
+                    ui.label(
+                        RichText::new(tr!("SyncApp.settings.networkAdapterSub"))
+                            .size(12.0)
+                            .color(arc_muted_text()),
+                    );
+                });
 
-            settings_row(
-                ui,
-                &tr!("SyncApp.settings.networkAdapter"),
-                &tr!("SyncApp.settings.networkAdapterSub"),
-                |ui| {
-                    // Force the dropdown and Refresh button to a common height so
-                    // they sit on the same baseline (egui won't reflow the first
-                    // widget once the taller one is added).
-                    ui.spacing_mut().interact_size.y = 30.0;
-                    refresh = ui
-                        .button(tr!("SyncApp.settings.refresh"))
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked();
-                    egui::ComboBox::from_id_salt("settings_interface_combo")
-                        .selected_text(selected_label)
-                        .width(theme::COMBO_ADAPTER)
-                        .truncate()
-                        .show_ui(ui, |ui| {
-                            for (index, interface) in self.interfaces.iter().enumerate() {
-                                let label = Self::interface_label(interface);
-                                if ui
-                                    .selectable_value(
-                                        &mut self.selected_interface_index,
-                                        index,
-                                        label,
-                                    )
-                                    .changed()
-                                {
-                                    selected_name = Some(interface.name.clone());
-                                }
+                let selected_label = self
+                    .selected_interface()
+                    .map(Self::interface_label)
+                    .unwrap_or_else(|| "Auto".to_string());
+                let mut selected_name = None;
+
+                egui::ComboBox::from_id_salt("settings_interface_combo")
+                    .selected_text(selected_label)
+                    .width(360.0)
+                    .show_ui(ui, |ui| {
+                        for (index, interface) in self.interfaces.iter().enumerate() {
+                            let label = Self::interface_label(interface);
+                            if ui
+                                .selectable_value(&mut self.selected_interface_index, index, label)
+                                .changed()
+                            {
+                                selected_name = Some(interface.name.clone());
                             }
-                        })
-                        .response
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                },
-            );
+                        }
+                    });
 
-            if let Some(name) = selected_name {
-                self.config.selected_interface = Some(name);
-                self.save_config();
-                self.capture_settings_changed();
-            }
+                if let Some(name) = selected_name {
+                    self.config.selected_interface = Some(name);
+                    self.save_config();
+                    self.capture_settings_changed();
+                }
 
-            if refresh {
-                self.refresh_interfaces();
-                self.refresh_sync_key_source();
-                self.npcap_available = None;
-            }
-
-            hairline(ui);
-
-            let mut chosen_method: Option<CaptureMethod> = None;
-            settings_row(
-                ui,
-                &tr!("SyncApp.settings.captureMethod"),
-                &tr!("SyncApp.settings.captureMethodSub"),
-                |ui| {
-                    ui.spacing_mut().interact_size.y = 30.0;
-                    let raw_socket_label = if cfg!(windows) {
-                        tr!("SyncApp.settings.captureRawSockets")
-                    } else {
-                        tr!("SyncApp.settings.captureRawSocketsLinux")
-                    };
-                    let current_label = match self.config.capture_method {
-                        CaptureMethod::RawSocket => raw_socket_label.clone(),
-                        CaptureMethod::Npcap => tr!("SyncApp.settings.captureNpcap"),
-                    };
-                    // Npcap is a Windows-only alternative (wpcap.dll); off
-                    // Windows the only backend is the AF_PACKET raw socket, so
-                    // don't offer a method whose `load()` would just fail.
-                    #[cfg(windows)]
-                    let methods: &[CaptureMethod] =
-                        &[CaptureMethod::RawSocket, CaptureMethod::Npcap];
-                    #[cfg(not(windows))]
-                    let methods: &[CaptureMethod] = &[CaptureMethod::RawSocket];
-                    egui::ComboBox::from_id_salt("settings_capture_method_combo")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
-                            for &method in methods {
-                                let label = match method {
-                                    CaptureMethod::RawSocket => raw_socket_label.clone(),
-                                    CaptureMethod::Npcap => tr!("SyncApp.settings.captureNpcap"),
-                                };
-                                if ui
-                                    .selectable_label(self.config.capture_method == method, label)
-                                    .clicked()
-                                    && self.config.capture_method != method
-                                {
-                                    chosen_method = Some(method);
-                                }
-                            }
-                        })
-                        .response
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                },
-            );
-
-            if let Some(method) = chosen_method {
-                self.config.capture_method = method;
-                self.save_config();
-                self.npcap_available = None;
-                self.capture_settings_changed();
-            }
-
-            if self.npcap_known_missing() {
-                ui.label(
-                    RichText::new(tr!("SyncApp.settings.npcapMissing"))
-                        .size(theme::TEXT_CAPTION)
-                        .color(arc_warning()),
-                );
-                ui.hyperlink_to(
-                    RichText::new(tr!("SyncApp.settings.npcapLink")).size(theme::TEXT_CAPTION),
-                    NPCAP_URL,
-                );
-            }
+                if ui.button(tr!("SyncApp.settings.refresh")).clicked() {
+                    self.refresh_interfaces();
+                    self.refresh_sync_key_source();
+                }
+            });
         });
     }
 
     fn render_settings_troubleshooting(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        settings_card(ui, &tr!("SyncApp.settings.troubleshooting"), |ui| {
-            let view_label = if self.show_activity_log {
-                tr!("SyncApp.settings.hide")
-            } else {
-                tr!("SyncApp.settings.view")
-            };
-            settings_row(
-                ui,
-                &tr!("SyncApp.settings.activityLog"),
-                &tr!("SyncApp.settings.activityLogSub"),
-                |ui| {
-                    if ui
-                        .button(view_label)
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        self.show_activity_log = !self.show_activity_log;
-                    }
-                },
-            );
-            hairline(ui);
-            settings_row(
-                ui,
-                &tr!("SyncApp.settings.copyDiagnostics"),
-                &tr!("SyncApp.settings.copyDiagnosticsSub"),
-                |ui| {
-                    if ui
-                        .button(tr!("SyncApp.settings.copy"))
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        self.copy_diagnostics(ctx);
-                    }
-                },
-            );
-            if self.show_activity_log {
-                ui.add_space(theme::SPACE_MD);
-                self.render_activity_log(ui);
-            }
+        settings_section(ui, &tr!("SyncApp.settings.troubleshooting"), |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(tr!("SyncApp.settings.activityLog")).color(arc_foreground()),
+                    );
+                    ui.label(
+                        RichText::new(tr!("SyncApp.settings.activityLogSub"))
+                            .size(12.0)
+                            .color(arc_muted_text()),
+                    );
+                });
+                if ui.button(tr!("SyncApp.settings.view")).clicked() {
+                    self.show_activity_log = !self.show_activity_log;
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(tr!("SyncApp.settings.copyDiagnostics"))
+                            .color(arc_foreground()),
+                    );
+                    ui.label(
+                        RichText::new(tr!("SyncApp.settings.copyDiagnosticsSub"))
+                            .size(12.0)
+                            .color(arc_muted_text()),
+                    );
+                });
+                if ui.button(tr!("SyncApp.settings.copy")).clicked() {
+                    self.copy_diagnostics(ctx);
+                }
+            });
         });
     }
 
@@ -3116,47 +2362,33 @@ impl ArcTrackerSyncApp {
                 RichText::new(
                     tr!("SyncApp.settings.version", version => env!("CARGO_PKG_VERSION")),
                 )
-                .font(egui::FontId::monospace(theme::TEXT_PILL))
-                .color(arc_fg_dim()),
+                .size(12.0)
+                .color(arc_muted_text()),
             );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if link_button(ui, &tr!("SyncApp.settings.whatIsSync")) {
-                    self.show_explainer = true;
+                if link_button(ui, &tr!("SyncApp.settings.checkForUpdates")) {
+                    let _ = auth_bridge::open_browser(BASE_URL);
                 }
             });
         });
     }
 
-    /// The activity log, rendered as an inset panel inside the Troubleshooting
-    /// card (each event prefixed with a muted "›", monospace).
-    fn render_activity_log(&self, ui: &mut egui::Ui) {
-        Frame::NONE
-            .fill(arc_input())
-            .stroke(Stroke::new(1.0, arc_border()))
-            .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                if self.messages.is_empty() {
-                    ui.label(RichText::new("—").color(arc_muted_text()));
-                } else {
-                    for message in &self.messages {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = theme::SPACE_SM;
-                            ui.label(
-                                RichText::new("›")
-                                    .font(egui::FontId::monospace(theme::TEXT_SUBLABEL))
-                                    .color(arc_border_strong()),
-                            );
-                            ui.label(
-                                RichText::new(Self::support_event_message(message))
-                                    .font(egui::FontId::monospace(theme::TEXT_SUBLABEL))
-                                    .color(arc_fg_dim()),
-                            );
-                        });
-                    }
+    fn render_activity_log(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.label(
+                RichText::new(tr!("SyncApp.settings.activityLog"))
+                    .strong()
+                    .color(arc_foreground()),
+            );
+            ui.add_space(6.0);
+            if self.messages.is_empty() {
+                ui.label(RichText::new("—").color(arc_muted_text()));
+            } else {
+                for message in &self.messages {
+                    ui.label(RichText::new(message).size(12.0).color(arc_muted_text()));
                 }
-            });
+            }
+        });
     }
 }
 
@@ -3169,9 +2401,10 @@ impl Drop for ArcTrackerSyncApp {
 impl ArcTrackerSyncApp {
     fn update_frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.pending_quit {
-            // Drain already-finished submit/refresh results (the polls never
-            // block on in-flight network work) so a just-refreshed token is
-            // persisted, then close so eframe's loop exits and runs Drop.
+            // Graceful shutdown: drain only ALREADY-finished submit/refresh
+            // results so a just-refreshed token is persisted (these poll calls
+            // never block on in-flight network work), stop capture cleanly, then
+            // ask eframe to close so its loop exits and runs Drop.
             self.poll_submit();
             self.poll_refresh();
             self.shutdown_cleanup();
@@ -3184,59 +2417,19 @@ impl ArcTrackerSyncApp {
 
         ctx.request_repaint_after(Duration::from_millis(750));
 
-        let maximized = ctx
-            .input(|input| input.viewport().maximized)
-            .unwrap_or(false);
-        let window_r = if maximized { 0 } else { theme::RADIUS_WINDOW };
-        let window_frame = Frame::NONE
-            .fill(arc_bg())
-            .stroke(Stroke::new(1.0, arc_border()))
-            .corner_radius(CornerRadius::same(window_r));
-
-        let state = self.hub_state();
-
         egui::CentralPanel::default()
-            .frame(window_frame)
+            .frame(Frame::NONE.fill(arc_bg()).inner_margin(Margin::same(24)))
             .show(ctx, |ui| {
-                let app_rect = ui.max_rect();
-                let title_rect = Rect::from_min_size(
-                    app_rect.min,
-                    vec2(app_rect.width(), theme::TITLE_BAR_HEIGHT),
-                );
-                let footer_rect = Rect::from_min_max(
-                    pos2(app_rect.left(), app_rect.bottom() - theme::FOOTER_HEIGHT),
-                    app_rect.max,
-                );
-                let body_rect = Rect::from_min_max(
-                    pos2(app_rect.left(), app_rect.top() + theme::TITLE_BAR_HEIGHT),
-                    pos2(app_rect.right(), app_rect.bottom() - theme::FOOTER_HEIGHT),
-                );
-
-                // Soft gold glow at the top of the body, clipped so it can't
-                // bleed over the title bar or the window's rounded corners.
-                top_glow(&ui.painter().with_clip_rect(body_rect), body_rect);
-
-                self.render_title_bar(ui, ctx, title_rect, maximized);
-                self.render_footer(ui, footer_rect, maximized);
-
-                ui.scope_builder(
-                    UiBuilder::new()
-                        .max_rect(body_rect)
-                        .layout(Layout::top_down(Align::Min)),
-                    |ui| match self.screen {
-                        Screen::Hub => self.render_hub_body(ui, ctx, state),
-                        Screen::Settings => self.render_settings_body(ui, ctx),
-                    },
-                );
-
-                // Edge/corner resize grips on top (a fixed window has none)
-                if !maximized {
-                    resize_handles(ctx, ui, app_rect);
+                ui.set_min_width(640.0);
+                match self.screen {
+                    Screen::Hub => {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.render_hub(ui, ctx));
+                    }
+                    Screen::Settings => self.render_settings(ui, ctx),
                 }
             });
-
-        self.render_explainer_modal(ctx);
-        self.render_update_modal(ctx);
     }
 }
 
@@ -3246,59 +2439,247 @@ impl eframe::App for SharedArcTrackerSyncApp {
             app.update_frame(ctx, frame);
         }
     }
+}
 
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+// ----- shared widgets & theme ------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageState {
+    Done,
+    Current,
+    Pending,
+}
+
+fn stage(done: bool, current: bool) -> StageState {
+    if done {
+        StageState::Done
+    } else if current {
+        StageState::Current
+    } else {
+        StageState::Pending
     }
 }
 
-// ----- app-local helpers ------------------------------------------------------
-
-/// The four stepper phases
-fn phase_node_labels(launcher: &str) -> [(String, String); 4] {
-    [
-        (
-            tr!("SyncApp.phase.account.label"),
-            tr!("SyncApp.phase.account.sub"),
-        ),
-        (
-            tr!("SyncApp.phase.launcher.label"),
-            tr!("SyncApp.phase.launcher.sub", launcher => launcher),
-        ),
-        (
-            tr!("SyncApp.phase.play.label"),
-            tr!("SyncApp.phase.play.sub"),
-        ),
-        (
-            tr!("SyncApp.phase.sync.label"),
-            tr!("SyncApp.phase.sync.sub"),
-        ),
-    ]
+fn current_time_label() -> String {
+    chrono::Local::now().format("%H:%M").to_string()
 }
 
-/// Activity-log notice for a user-set SSLKEYLOGFILE that was ignored. Uses the
-/// app's "sync key" product term so it reads cleanly in the activity log and
-/// doesn't trip `support_event_message`'s secret-value redaction; the username
-/// in the path is scrubbed by `push_message` as usual.
-fn skipped_sync_key_notice(path: &Path) -> String {
-    format!(
-        "Ignoring sync key setting that isn't a usable file: {} — using the app-managed sync key instead",
-        path.display()
+pub(crate) fn primary_button(ui: &mut egui::Ui, label: &str) -> bool {
+    let button = egui::Button::new(
+        RichText::new(label)
+            .strong()
+            .color(arc_primary_foreground()),
     )
+    .fill(arc_primary())
+    .stroke(Stroke::NONE)
+    .corner_radius(CornerRadius::same(6));
+    ui.add(button).clicked()
 }
 
-/// Session-expiry label, date always included: Embark tokens last exactly 24h,
-/// so a bare time-of-day reads as the moment the token was captured. `None`
-/// when the expiry isn't genuinely in the future — a near-now value is just
-/// the current token about to rotate and reads as "expires right now".
-fn expiry_label(
-    exp: chrono::DateTime<chrono::Local>,
-    now: chrono::DateTime<chrono::Local>,
-) -> Option<String> {
-    if exp <= now + chrono::Duration::minutes(2) {
-        return None;
+pub(crate) fn secondary_button(ui: &mut egui::Ui, label: &str) -> bool {
+    let button = egui::Button::new(RichText::new(label).color(arc_foreground()))
+        .fill(arc_input())
+        .stroke(Stroke::new(1.0, arc_border()))
+        .corner_radius(CornerRadius::same(6));
+    ui.add(button).clicked()
+}
+
+fn link_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add(egui::Button::new(RichText::new(label).color(arc_primary())).frame(false))
+        .clicked()
+}
+
+/// One segment of the Steam|Epic toggle: filled when it's the active launcher,
+/// outlined otherwise.
+fn launcher_segment(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
+    let (fill, text, stroke) = if selected {
+        (arc_primary(), arc_primary_foreground(), Stroke::NONE)
+    } else {
+        (
+            arc_input(),
+            arc_foreground(),
+            Stroke::new(1.0, arc_border()),
+        )
+    };
+    let button = egui::Button::new(RichText::new(label).size(12.0).color(text))
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(6));
+    ui.add(button).clicked()
+}
+
+fn toggle_row(ui: &mut egui::Ui, label: &str, sub: &str, value: &mut bool) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(label).color(arc_foreground()));
+            ui.label(RichText::new(sub).size(12.0).color(arc_muted_text()));
+        });
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            changed = ui.add(egui::Checkbox::without_text(value)).changed();
+        });
+    });
+    changed
+}
+
+fn settings_section<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    card(ui, |ui| {
+        ui.label(
+            RichText::new(title)
+                .size(14.0)
+                .strong()
+                .color(arc_primary()),
+        );
+        ui.add_space(10.0);
+        add_contents(ui)
+    })
+}
+
+pub(crate) fn apply_arc_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = arc_bg();
+    visuals.window_fill = arc_card();
+    visuals.extreme_bg_color = arc_input();
+    visuals.faint_bg_color = arc_muted();
+    visuals.hyperlink_color = arc_primary();
+    visuals.selection.bg_fill = arc_primary();
+    visuals.selection.stroke = Stroke::new(1.0, arc_primary_foreground());
+    visuals.widgets.inactive.bg_fill = arc_input();
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, arc_foreground());
+    visuals.widgets.hovered.bg_fill = arc_muted();
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, arc_foreground());
+    visuals.widgets.active.bg_fill = arc_primary();
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, arc_primary_foreground());
+
+    let mut style = (*ctx.style()).clone();
+    style.visuals = visuals;
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.button_padding = Vec2::new(12.0, 7.0);
+    style.spacing.combo_width = 220.0;
+    ctx.set_style(style);
+}
+
+pub(crate) fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    Frame::NONE
+        .fill(arc_card())
+        .stroke(Stroke::new(1.0, arc_border()))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(16))
+        .show(ui, add_contents)
+        .inner
+}
+
+fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
+    Frame::NONE
+        .fill(color.linear_multiply(0.16))
+        .stroke(Stroke::new(1.0, color.linear_multiply(0.55)))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(12.0).strong().color(color));
+        });
+}
+
+/// Like [`pill`], but the whole chip is a click target — used for the header
+/// "update available" indicator that opens the changelog dialog.
+fn clickable_pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    let inner = Frame::NONE
+        .fill(color.linear_multiply(0.16))
+        .stroke(Stroke::new(1.0, color.linear_multiply(0.55)))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(12.0).strong().color(color));
+        });
+    ui.interact(
+        inner.response.rect,
+        egui::Id::new("arc_update_pill"),
+        egui::Sense::click(),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn progress_stage(ui: &mut egui::Ui, label: &str, state: StageState) {
+    let (color, marker) = match state {
+        StageState::Done => (arc_success(), "●"),
+        StageState::Current => (arc_primary(), "◆"),
+        StageState::Pending => (arc_muted_text(), "○"),
+    };
+    ui.label(RichText::new(marker).size(12.0).color(color));
+    ui.add_space(4.0);
+    let text_color = if state == StageState::Pending {
+        arc_muted_text()
+    } else {
+        arc_foreground()
+    };
+    let mut text = RichText::new(label).size(12.0).color(text_color);
+    if state == StageState::Current {
+        text = text.strong();
     }
-    Some(exp.format("%b %-d, %H:%M").to_string())
+    ui.label(text);
+}
+
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 7.0, color);
+}
+
+/// A spinner followed by a status line — the body of the update dialog while an
+/// install is in progress.
+fn spinner_row(ui: &mut egui::Ui, label: &str) {
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.add_space(8.0);
+        ui.label(RichText::new(label).size(15.0).color(arc_foreground()));
+    });
+}
+
+pub(crate) fn arc_bg() -> Color32 {
+    Color32::from_rgb(18, 24, 31)
+}
+
+fn arc_card() -> Color32 {
+    Color32::from_rgb(26, 33, 42)
+}
+
+fn arc_input() -> Color32 {
+    Color32::from_rgb(22, 29, 37)
+}
+
+fn arc_muted() -> Color32 {
+    Color32::from_rgb(36, 44, 55)
+}
+
+fn arc_border() -> Color32 {
+    Color32::from_rgb(52, 61, 74)
+}
+
+pub(crate) fn arc_foreground() -> Color32 {
+    Color32::from_rgb(237, 240, 244)
+}
+
+pub(crate) fn arc_muted_text() -> Color32 {
+    Color32::from_rgb(156, 164, 176)
+}
+
+fn arc_primary() -> Color32 {
+    Color32::from_rgb(255, 198, 1)
+}
+
+fn arc_primary_foreground() -> Color32 {
+    Color32::from_rgb(24, 25, 28)
+}
+
+fn arc_success() -> Color32 {
+    Color32::from_rgb(80, 220, 150)
+}
+
+pub(crate) fn arc_warning() -> Color32 {
+    Color32::from_rgb(248, 165, 80)
 }
 
 #[cfg(test)]
@@ -3306,109 +2687,171 @@ mod tests {
     use super::*;
 
     #[test]
-    fn submit_backoff_escalates_then_gives_up() {
-        use std::time::Duration;
-        assert_eq!(ArcTrackerSyncApp::submit_backoff(0), None);
-        assert_eq!(
-            ArcTrackerSyncApp::submit_backoff(1),
-            Some(Duration::from_secs(30))
-        );
-        assert_eq!(
-            ArcTrackerSyncApp::submit_backoff(2),
-            Some(Duration::from_secs(60))
-        );
-        assert_eq!(
-            ArcTrackerSyncApp::submit_backoff(3),
-            Some(Duration::from_secs(120))
-        );
-        assert_eq!(
-            ArcTrackerSyncApp::submit_backoff(4),
-            Some(Duration::from_secs(300))
-        );
-        assert_eq!(
-            ArcTrackerSyncApp::submit_backoff(5),
-            Some(Duration::from_secs(600))
-        );
-        assert_eq!(ArcTrackerSyncApp::submit_backoff(6), None);
-        assert_eq!(ArcTrackerSyncApp::submit_backoff(100), None);
+    fn customer_copy_avoids_technical_terms() {
+        let mut copy = customer_visible_copy_samples().join("\n");
+        copy.push('\n');
+        copy.push_str(include_str!("../README.md"));
+        let copy = copy.to_ascii_lowercase();
+
+        for term in blocked_customer_terms() {
+            assert!(
+                !copy.contains(&term),
+                "customer-visible copy contains blocked term: {term}"
+            );
+        }
     }
 
     #[test]
-    fn events_store_raw_detail_and_redact_only_at_render() {
-        // The activity log stores the path-scrubbed raw message so the copied
-        // diagnostics keep failure detail (status codes, hosts) ...
-        let raw = "ARCTracker rejected token submission with HTTP 503: upstream timeout";
-        let stored = ArcTrackerSyncApp::stored_event_message(raw);
-        assert!(stored.contains("HTTP 503"), "stored: {stored}");
-
-        // ... and the on-screen log keeps that real detail too; only secret
-        // values (an access token) would be redacted, and there is none here.
-        let shown = ArcTrackerSyncApp::support_event_message(&stored);
-        assert_eq!(
-            shown,
-            "ARCTracker rejected token submission with HTTP 503: upstream timeout"
-        );
-
-        // Username scrubbing still applies at storage time.
-        let stored =
-            ArcTrackerSyncApp::stored_event_message("loading C:\\Users\\someone\\file.log failed");
-        assert!(
-            stored.contains("<user>") && !stored.contains("someone"),
-            "stored: {stored}"
-        );
-    }
-
-    #[test]
-    fn skipped_sync_key_notice_survives_support_redaction() {
-        let notice = skipped_sync_key_notice(Path::new("C:\\Users\\someone\\Documents"));
-        let shown = ArcTrackerSyncApp::support_event_message(&notice);
-
-        assert!(
-            shown.contains("Ignoring sync key setting"),
-            "notice carries no token value, so it shows intact: {shown}"
-        );
-        assert!(
-            shown.contains("<user>") && !shown.contains("someone"),
-            "username should be scrubbed: {shown}"
-        );
-    }
-
-    #[test]
-    fn expiry_label_always_includes_the_date() {
-        use chrono::TimeZone;
-
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 6, 9, 16, 44, 48)
-            .unwrap();
-
-        // A 24h Embark token: same time-of-day tomorrow must carry the date so
-        // it can't be misread as the capture time.
-        let exp = now + chrono::Duration::hours(24);
-        assert_eq!(expiry_label(exp, now).as_deref(), Some("Jun 10, 16:44"));
-
-        // Even a same-day expiry shows the date.
-        let exp = now + chrono::Duration::hours(3);
-        assert_eq!(expiry_label(exp, now).as_deref(), Some("Jun 9, 19:44"));
-    }
-
-    #[test]
-    fn expiry_label_hides_near_now_or_past_expiry() {
-        use chrono::TimeZone;
-
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 6, 9, 16, 0, 0)
-            .unwrap();
-        assert_eq!(expiry_label(now + chrono::Duration::minutes(1), now), None);
-        assert_eq!(expiry_label(now - chrono::Duration::hours(1), now), None);
-    }
-
-    #[test]
-    fn support_event_message_redacts_the_token_value_only() {
-        // The access token is scrubbed; the rest of the line — including the
-        // honest mechanism words — is shown as-is.
+    fn support_event_message_redacts_sensitive_details() {
         let event = ArcTrackerSyncApp::support_event_message(
             "Authorization: Bearer abc.def.ghi over HTTP failed",
         );
-        assert_eq!(event, "Authorization: Bearer <redacted> over HTTP failed");
+        assert_eq!(event, "Local sync needs attention.");
+    }
+
+    #[test]
+    fn support_event_message_keeps_the_account_deletion_reason() {
+        // The reason arctracker.io gives for a sign-in into an account scheduled for deletion
+        // names no token or HTTP, so the event log shows it as it is.
+        let message = "ARCTracker sign-in failed: This account is scheduled for deletion on 2026-10-04. Cancel the deletion in your arctracker.io settings, then sign in again.";
+        assert_eq!(ArcTrackerSyncApp::support_event_message(message), message);
+    }
+
+    fn blocked_customer_terms() -> Vec<String> {
+        [
+            "authorization",
+            "bearer",
+            "capture",
+            "http/",
+            "keylog",
+            "key log",
+            "packet",
+            "protocol",
+            "secret",
+            "ssl",
+            "tls",
+            "token",
+            "tshark",
+            "wireshark",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// The full set of user-visible strings — pulled straight from the active
+    /// (English) catalog so the jargon check tracks the real copy.
+    fn customer_visible_copy_samples() -> Vec<String> {
+        i18n::set_active_locale("en");
+        let keys = [
+            "SyncApp.appName",
+            "SyncApp.header.signedIn",
+            "SyncApp.header.signedOut",
+            "SyncApp.progress.signedIn",
+            "SyncApp.progress.launcherReady",
+            "SyncApp.progress.playing",
+            "SyncApp.progress.synced",
+            "SyncApp.footer.notSignedIn",
+            "SyncApp.footer.settings",
+            "SyncApp.state.needsAdmin.title",
+            "SyncApp.state.needsAdmin.body",
+            "SyncApp.state.signedOut.title",
+            "SyncApp.state.signedOut.body",
+            "SyncApp.state.signingIn.title",
+            "SyncApp.state.signingIn.body",
+            "SyncApp.state.selectGame.title",
+            "SyncApp.state.selectGame.body",
+            "SyncApp.state.prepareLauncher.title",
+            "SyncApp.state.prepareLauncher.body",
+            "SyncApp.state.preparingLauncher.title",
+            "SyncApp.state.preparingLauncher.body",
+            "SyncApp.state.closeLauncher.title",
+            "SyncApp.state.closeLauncher.body",
+            "SyncApp.state.launcherReady.title",
+            "SyncApp.state.launcherReady.body",
+            "SyncApp.state.connecting.title",
+            "SyncApp.state.connecting.body",
+            "SyncApp.state.updating.title",
+            "SyncApp.state.updating.body",
+            "SyncApp.state.synced.title",
+            "SyncApp.state.synced.body",
+            "SyncApp.state.synced.session",
+            "SyncApp.state.synced.canClose",
+            "SyncApp.state.syncedIdle.body",
+            "SyncApp.state.needsLauncher.title",
+            "SyncApp.state.needsLauncher.body",
+            "SyncApp.state.needsAttention.title",
+            "SyncApp.state.needsAttention.body",
+            "SyncApp.action.signIn",
+            "SyncApp.action.cancel",
+            "SyncApp.action.chooseGame",
+            "SyncApp.action.prepareLauncher",
+            "SyncApp.action.whatDoesThisDo",
+            "SyncApp.action.closeLauncher",
+            "SyncApp.action.hideToTray",
+            "SyncApp.action.getHelp",
+            "SyncApp.action.tryAgain",
+            "SyncApp.action.restartAsAdmin",
+            "SyncApp.action.gotIt",
+            "SyncApp.explain.title",
+            "SyncApp.explain.body",
+            "SyncApp.settings.title",
+            "SyncApp.settings.account",
+            "SyncApp.settings.staysSignedIn",
+            "SyncApp.settings.signOut",
+            "SyncApp.settings.gameLauncher",
+            "SyncApp.settings.launcher",
+            "SyncApp.settings.arcLocation",
+            "SyncApp.settings.autoDetected",
+            "SyncApp.settings.change",
+            "SyncApp.settings.startup",
+            "SyncApp.settings.startWithWindows",
+            "SyncApp.settings.startWithWindowsSub",
+            "SyncApp.settings.keepInTray",
+            "SyncApp.settings.keepInTraySub",
+            "SyncApp.settings.language",
+            "SyncApp.settings.displayLanguage",
+            "SyncApp.settings.matchesWindows",
+            "SyncApp.settings.network",
+            "SyncApp.settings.networkAdapter",
+            "SyncApp.settings.networkAdapterSub",
+            "SyncApp.settings.refresh",
+            "SyncApp.settings.troubleshooting",
+            "SyncApp.settings.activityLog",
+            "SyncApp.settings.activityLogSub",
+            "SyncApp.settings.view",
+            "SyncApp.settings.copyDiagnostics",
+            "SyncApp.settings.copyDiagnosticsSub",
+            "SyncApp.settings.copy",
+            "SyncApp.settings.checkForUpdates",
+            "SyncApp.tray.open",
+            "SyncApp.tray.pause",
+            "SyncApp.tray.resume",
+            "SyncApp.tray.signOut",
+            "SyncApp.tray.quit",
+            "SyncApp.tray.tooltipIdle",
+            "SyncApp.bridge.successTitle",
+            "SyncApp.bridge.successBody",
+            "SyncApp.bridge.errorTitle",
+            "SyncApp.bridge.errorBody",
+            "SyncApp.update.pill",
+            "SyncApp.update.title",
+            "SyncApp.update.changelogHeading",
+            "SyncApp.update.install",
+            "SyncApp.update.later",
+            "SyncApp.update.retry",
+            "SyncApp.update.downloading",
+            "SyncApp.update.verifying",
+            "SyncApp.update.installing",
+            "SyncApp.update.restarting",
+            "SyncApp.update.failed",
+            "SyncApp.retired.title",
+            "SyncApp.retired.body",
+            "SyncApp.retired.uninstall",
+            "SyncApp.retired.getLink",
+            "SyncApp.retired.quit",
+            "SyncApp.retired.openFailed",
+        ];
+        keys.into_iter().map(|key| tr!(key)).collect()
     }
 }

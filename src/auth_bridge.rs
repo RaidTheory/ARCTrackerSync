@@ -14,7 +14,10 @@ const APP_ID: &str = "arctracker-sync";
 const CALLBACK_PORT: u16 = 39876;
 const CALLBACK_PATH: &str = "/auth/callback";
 
+/// Branded "you're signed in" page (dark ARC theme). Owned by the
+/// BRIDGE-ASSETS area; this module wires it in and localizes it.
 const SUCCESS_HTML: &str = include_str!("../assets/bridge/success.html");
+/// Branded "sign-in didn't finish" page.
 const ERROR_HTML: &str = include_str!("../assets/bridge/error.html");
 
 pub struct AuthAttempt {
@@ -46,8 +49,8 @@ pub fn token_is_current(token: &str) -> bool {
     exp > now + 30
 }
 
-/// Whole days until the token's `exp` claim; negative once expired, `None` if
-/// the token has no readable expiry.
+/// Whole days until the token's `exp` claim. `None` if the token has no
+/// readable expiry. Negative values mean it has already expired.
 pub fn token_days_remaining(token: &str) -> Option<i64> {
     let exp = token_expires_at(token)?;
     let now = unix_time_seconds();
@@ -60,8 +63,7 @@ fn token_expires_at(token: &str) -> Option<i64> {
     let claims: Value = serde_json::from_slice(&bytes).ok()?;
     let exp = claims.get("exp")?;
     // Some JWT libraries serialize `exp` as a float; accept both forms.
-    exp.as_i64()
-        .or_else(|| exp.as_f64().map(|value| value as i64))
+    exp.as_i64().or_else(|| exp.as_f64().map(|value| value as i64))
 }
 
 fn build_authorize_url(base_url: &str, state: &str) -> String {
@@ -135,8 +137,8 @@ fn accept_callback(listener: TcpListener, expected_state: &str) -> Result<String
         .nth(1)
         .ok_or_else(|| anyhow!("auth callback request has no target"))?;
 
-    // Reject anything that reached the socket under a non-loopback Host
-    // (e.g. DNS rebinding).
+    // Only honour requests that addressed us as the local loopback bridge; reject
+    // anything that reached the socket under a different Host (e.g. DNS rebinding).
     if !host_is_loopback(&request) {
         write_branded_response(&mut stream, BridgeOutcome::Error)?;
         return Err(anyhow!("auth callback had a non-loopback Host header"));
@@ -175,7 +177,9 @@ enum BridgeOutcome {
     Error,
 }
 
-/// Render the branded bridge page in the app's active language.
+/// Render the branded bridge page for the app's active language and write it as
+/// an HTTP response. Substitutes the `SyncApp.bridge.*` strings into the
+/// asset's `{{TITLE}}` / `{{BODY}}` / `{{LANG}}` / `{{DIR}}` placeholders.
 fn render_bridge_page(outcome: BridgeOutcome) -> String {
     let (template, title, body) = match outcome {
         BridgeOutcome::Success => (
@@ -237,9 +241,10 @@ extern "system" {
     ) -> isize;
 }
 
-/// Read the HTTP request head, looping until the `\r\n\r\n` terminator — the
-/// browser may split the request across TCP segments. A read timeout and size
-/// cap keep a misbehaving client from blocking the callback thread.
+/// Read the HTTP request head from `stream`. The browser may split the request
+/// across TCP segments, so loop until the `\r\n\r\n` header terminator is seen
+/// rather than truncating on the first `read`. A read timeout and a hard cap
+/// keep a misbehaving client from blocking the callback thread forever.
 fn read_http_request(stream: &mut TcpStream) -> Result<String> {
     const MAX_REQUEST_BYTES: usize = 16 * 1024;
 
@@ -263,6 +268,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<String> {
     Ok(String::from_utf8_lossy(&request).to_string())
 }
 
+/// Offset just past the `\r\n\r\n` that separates the HTTP head from the body,
+/// if present.
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer
         .windows(4)
@@ -270,8 +277,10 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
         .map(|index| index + 4)
 }
 
-/// True when the request's `Host` header is `127.0.0.1` or `localhost` (with or
-/// without a port). A missing Host is rejected.
+/// True when the request's `Host` header names the local loopback bridge
+/// (`127.0.0.1` or `localhost`, with the callback port or no port). A missing or
+/// foreign Host is rejected so only requests that addressed us as the loopback
+/// callback are honoured.
 fn host_is_loopback(request: &str) -> bool {
     let Some(host) = request
         .lines()
@@ -305,8 +314,9 @@ fn query_value(query: &str, key: &str) -> Option<String> {
     })
 }
 
-/// CSRF `state` from the OS CSPRNG. Fails loud if the CSPRNG is unavailable
-/// rather than falling back to a predictable value.
+/// Build the CSRF `state` from the OS CSPRNG: 32 random bytes, hex-encoded, then
+/// truncated to 32 hex chars. Fails loud if the CSPRNG is unavailable rather
+/// than falling back to a predictable value.
 fn make_state() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes)
@@ -398,6 +408,34 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "ARCTracker sign-in failed: sign_in_unavailable"
+        );
+    }
+
+    #[test]
+    fn callback_error_sentence_reads_as_is() {
+        // arctracker.io answers a sign-in into an account scheduled for deletion with a readable
+        // reason in `error` (URLSearchParams encoding: `+` for spaces, `%2C` for commas).
+        crate::i18n::set_active_locale("en");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let worker =
+            thread::spawn(move || accept_callback(listener, "state-123").expect_err("callback"));
+
+        let mut stream = TcpStream::connect(address).expect("connect callback");
+        stream
+            .write_all(
+                b"GET /auth/callback?state=state-123&error=This+account+is+scheduled+for+deletion+on+2026-10-04.+Cancel+the+deletion+in+your+arctracker.io+settings%2C+then+sign+in+again. HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+            .expect("write request");
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        let error = worker.join().expect("worker result");
+
+        assert!(response.contains("400 Bad Request"));
+        assert_eq!(
+            error.to_string(),
+            "ARCTracker sign-in failed: This account is scheduled for deletion on 2026-10-04. Cancel the deletion in your arctracker.io settings, then sign in again."
         );
     }
 

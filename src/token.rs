@@ -9,18 +9,6 @@ use sha2::{Digest, Sha256};
 
 pub const EMBARK_HOST: &str = "api-gateway.europe.es-pio.net";
 
-/// Hosts the game presents its Embark access token to. The api-gateway request
-/// only happens around login, so token capture must also accept the pubsub
-/// hosts that fire continuously during gameplay — otherwise starting the app
-/// mid-session never syncs. `auth.embark.net` is deliberately excluded:
-/// requests there can carry auth-flow credentials that aren't the gameplay
-/// access token.
-pub const EMBARK_TOKEN_HOSTS: &[&str] = &[
-    EMBARK_HOST,
-    "client2pubsub.europe.es-pio.net",
-    "client2pubsub-ipv4.europe.es-pio.net",
-];
-
 #[derive(Debug, Clone, Default)]
 pub struct RawTokenHit {
     pub token: String,
@@ -64,8 +52,8 @@ impl TokenObservation {
         }
     }
 
-    /// Expiry from the JWT `exp` claim; `None` if the token isn't a readable
-    /// JWT with a numeric `exp`.
+    /// Expiry of this Embark access token, decoded from its JWT `exp` claim.
+    /// `None` if the token isn't a readable JWT with a numeric `exp`.
     pub fn expires_at(&self) -> Option<DateTime<Local>> {
         let payload = self.token.split('.').nth(1)?;
         let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
@@ -254,9 +242,7 @@ fn bearer_from_header(value: &str) -> Option<String> {
 fn is_embark_host(host: &str) -> bool {
     let host = host.trim().trim_end_matches('.');
     let host_without_port = host.split_once(':').map(|(h, _)| h).unwrap_or(host);
-    EMBARK_TOKEN_HOSTS
-        .iter()
-        .any(|known| host_without_port.eq_ignore_ascii_case(known))
+    host_without_port.eq_ignore_ascii_case(EMBARK_HOST)
 }
 
 fn is_http_method(method: &str) -> bool {
@@ -272,14 +258,17 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// Domain-separation prefix for observation fingerprints: the dedup key is
-/// `SHA-256(DEDUP_DOMAIN || token)` rather than bare `SHA-256(token)`, so the
-/// stored/loggable fingerprint can't be precomputed against candidate bearers.
+/// Fixed domain-separation prefix for observation fingerprints. The dedup key is
+/// `SHA-256(DEDUP_DOMAIN || token)` rather than a bare `SHA-256(token)`, so the
+/// stored/loggable fingerprint is personalized to this observation set instead of
+/// a generic token hash that could be precomputed against candidate bearers.
 const DEDUP_DOMAIN: [u8; 64] = [
-    0xf5, 0x27, 0x21, 0x48, 0x72, 0x93, 0x63, 0xf9, 0xda, 0xb0, 0xd7, 0x1b, 0x24, 0x9d, 0x13, 0xf2,
-    0xce, 0xe1, 0x51, 0xf7, 0x9c, 0x76, 0x5c, 0xb6, 0xeb, 0x12, 0x69, 0x0d, 0xfa, 0x47, 0x4b, 0x27,
-    0x95, 0x0b, 0x07, 0x29, 0x10, 0x8d, 0x69, 0x32, 0x72, 0x26, 0xec, 0x71, 0x72, 0xcd, 0x38, 0x3d,
-    0xe1, 0xb6, 0xe5, 0x36, 0x67, 0x86, 0xa2, 0x15, 0xf3, 0xf3, 0x9e, 0xf8, 0x27, 0x11, 0xa9, 0x0b,
+    0xf5, 0x27, 0x21, 0x48, 0x72, 0x93, 0x63, 0xf9, 0xda, 0xb0, 0xd7, 0x1b,
+    0x24, 0x9d, 0x13, 0xf2, 0xce, 0xe1, 0x51, 0xf7, 0x9c, 0x76, 0x5c, 0xb6,
+    0xeb, 0x12, 0x69, 0x0d, 0xfa, 0x47, 0x4b, 0x27, 0x95, 0x0b, 0x07, 0x29,
+    0x10, 0x8d, 0x69, 0x32, 0x72, 0x26, 0xec, 0x71, 0x72, 0xcd, 0x38, 0x3d,
+    0xe1, 0xb6, 0xe5, 0x36, 0x67, 0x86, 0xa2, 0x15, 0xf3, 0xf3, 0x9e, 0xf8,
+    0x27, 0x11, 0xa9, 0x0b,
 ];
 
 fn fingerprint(token: &str) -> String {
@@ -318,44 +307,16 @@ mod tests {
     }
 
     #[test]
-    fn http1_hit_extracts_bearer_from_client2pubsub_host() {
-        let token = fake_jwt();
-        let request = format!(
-            "POST /client2pubsub.Client2PubSub/TransferBatched HTTP/1.1\r\n\
-             Host: client2pubsub-ipv4.europe.es-pio.net\r\n\
-             Authorization: Bearer {token}\r\n\
-             \r\n"
-        );
-
-        let (hit, _) = http1_hit(request.as_bytes()).expect("token hit");
-        assert_eq!(hit.token, token);
-        assert_eq!(hit.host, "client2pubsub-ipv4.europe.es-pio.net");
-        assert_eq!(
-            hit.path.as_deref(),
-            Some("/client2pubsub.Client2PubSub/TransferBatched")
-        );
-    }
-
-    #[test]
     fn http1_hit_rejects_other_hosts() {
-        for host in [
-            "example.com",
-            "auth.embark.net",
-            "client2pubsub-ipv4.europe.es-pio.net.evil.test",
-        ] {
-            let request = format!(
-                "POST /v1/shared/manifest HTTP/1.1\r\n\
-                 Host: {host}\r\n\
-                 Authorization: Bearer {}\r\n\
-                 \r\n",
-                fake_jwt()
-            );
+        let request = format!(
+            "POST /v1/shared/manifest HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             Authorization: Bearer {}\r\n\
+             \r\n",
+            fake_jwt()
+        );
 
-            assert!(
-                http1_hit(request.as_bytes()).is_none(),
-                "host should not produce a hit: {host}"
-            );
-        }
+        assert!(http1_hit(request.as_bytes()).is_none());
     }
 
     #[test]

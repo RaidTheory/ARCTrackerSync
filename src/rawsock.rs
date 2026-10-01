@@ -1,20 +1,21 @@
-//! Packet-capture backend using Windows raw sockets (`SIO_RCVALL`) — no
-//! kernel driver to bundle, but the process must run elevated (raw sockets
-//! need Administrator).
+//! Driver-free packet-capture backend using Windows raw sockets (`SIO_RCVALL`).
 //!
-//! Delivers raw IPv4 packets (no link-layer header), reported as `DLT_RAW`
-//! for `packet.rs` — including the Windows quirk where outbound packets are
-//! exposed before the IPv4 total-length field is filled in. IPv6 is
-//! intentionally not captured: the Embark gateway is reached over IPv4, and
-//! raw IPv6 sockets don't deliver the IP header consistently.
+//! This is the app's sole capture backend: nothing to bundle, no kernel driver
+//! and no license — it uses the OS networking stack directly. The trade-off is
+//! that it requires the process to run **elevated** (raw sockets need
+//! Administrator).
+//!
+//! It delivers raw IPv4 packets (no link-layer header), reported as `DLT_RAW`,
+//! which `packet.rs` already parses — including the Windows quirk where
+//! *outbound* IPv4 packets are exposed before the total-length field is filled
+//! in (see `packet.rs`). IPv6 is intentionally not captured here: the Embark
+//! gateway is reached over IPv4, and raw IPv6 sockets don't deliver the IP
+//! header consistently.
 
 #[cfg(windows)]
 pub use imp::{Capture, RawSock};
 
-#[cfg(target_os = "linux")]
-pub use linux::{Capture, RawSock};
-
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(not(windows))]
 pub use stub::{Capture, RawSock};
 
 #[cfg(windows)]
@@ -36,19 +37,20 @@ mod imp {
     const SOL_SOCKET: i32 = 0xffff;
     const SO_RCVBUF: i32 = 0x1002;
     const SIO_RCVALL: u32 = 0x9800_0001; // _WSAIOW(IOC_VENDOR, 1)
-                                         // RCVALL_IPLEVEL: all packets to/from this interface's IP, both directions,
-                                         // without promiscuous mode. RCVALL_ON (1, full promiscuous) is unreliable
-                                         // for the host's own inbound traffic, notably on Wi-Fi — it drops the
-                                         // ServerHello and breaks TLS key establishment.
+    // RCVALL_IPLEVEL: receive all packets to/from this interface's IP (both
+    // directions of THIS host's traffic) without promiscuous mode. RCVALL_ON (1,
+    // full promiscuous) is unreliable for a host's own inbound traffic, notably
+    // on Wi-Fi — which drops the ServerHello and breaks TLS key establishment.
     const RCVALL_IPLEVEL: u32 = 3;
     const FIONBIO: i32 = 0x8004_667e_u32 as i32;
     const INVALID_SOCKET: usize = usize::MAX;
     const SOCKET_ERROR: i32 = -1;
     const WSAEWOULDBLOCK: i32 = 10035;
     const WSAEACCES: i32 = 10013;
-    // Datagram larger than the buffer; Winsock has already filled the buffer
-    // and discarded the rest. Happens with LSO/GRO-offloaded segments that
-    // exceed RECV_BUF — treat as truncation, never as a fatal error.
+    // The datagram was larger than the supplied buffer; Winsock has already
+    // filled the buffer with the first `len` bytes and discarded the rest. Can
+    // happen with LSO/GRO-offloaded segments that exceed RECV_BUF — treat as a
+    // truncated packet and keep capturing, never as a fatal error.
     const WSAEMSGSIZE: i32 = 10040;
     const WINSOCK_VERSION: u16 = 0x0202; // 2.2
 
@@ -91,9 +93,9 @@ mod imp {
                 .into_iter()
                 .find(|adapter| adapter.name == name)
                 .ok_or_else(|| anyhow!("network adapter {name} is no longer available"))?;
-            let bind_addr = adapter.v4_sockaddr.ok_or_else(|| {
-                anyhow!("network adapter {name} has no IPv4 address to capture on")
-            })?;
+            let bind_addr = adapter
+                .v4_sockaddr
+                .ok_or_else(|| anyhow!("network adapter {name} has no IPv4 address to capture on"))?;
             let socket = open_rcvall_socket(&bind_addr)?;
             Ok(Capture {
                 sockets: vec![socket],
@@ -139,8 +141,9 @@ mod imp {
                     match error {
                         WSAEWOULDBLOCK => {} // nothing here, try the next socket.
                         WSAEMSGSIZE => {
-                            // buf already holds the truncated prefix of an
-                            // oversized datagram; deliver it and keep going.
+                            // Buffer is already filled with the first buf.len()
+                            // bytes of an oversized datagram; deliver that
+                            // (truncated) prefix and keep the loop alive.
                             self.truncations = self.truncations.wrapping_add(1);
                             let len = self.buf.len();
                             return Ok(Some(Packet {
@@ -156,8 +159,9 @@ mod imp {
                 // read == 0 → nothing here, try the next socket.
             }
 
-            // Nothing ready; block up to 100 ms for a socket to become readable
-            // so the capture loop doesn't busy-spin. The next call does the recv.
+            // Nothing ready right now. Block up to 100 ms for a socket to become
+            // readable so the capture loop doesn't busy-spin (a 100 ms poll
+            // timeout). The next call does the actual recv.
             wait_readable(&self.sockets, 100);
             Ok(None)
         }
@@ -207,13 +211,8 @@ mod imp {
             bail!("creating raw socket failed: WSA error {error}");
         }
 
-        if unsafe {
-            bind(
-                socket_handle,
-                bind_sockaddr.as_ptr(),
-                bind_sockaddr.len() as i32,
-            )
-        } == SOCKET_ERROR
+        if unsafe { bind(socket_handle, bind_sockaddr.as_ptr(), bind_sockaddr.len() as i32) }
+            == SOCKET_ERROR
         {
             let error = unsafe { WSAGetLastError() };
             unsafe { closesocket(socket_handle) };
@@ -446,8 +445,8 @@ mod imp {
     struct IpAdapterUnicastAddress {
         length_flags: u64, // union { ULONGLONG Alignment; { ULONG Length; DWORD Flags; } }
         next: *const IpAdapterUnicastAddress,
-        sockaddr: *const u8, // SOCKET_ADDRESS.lpSockaddr
-        sockaddr_len: i32,   // SOCKET_ADDRESS.iSockaddrLength
+        sockaddr: *const u8,  // SOCKET_ADDRESS.lpSockaddr
+        sockaddr_len: i32,    // SOCKET_ADDRESS.iSockaddrLength
     }
 
     #[link(name = "Ws2_32")]
@@ -492,202 +491,7 @@ mod imp {
     }
 }
 
-/// Linux capture backend using an `AF_PACKET`/`SOCK_RAW` socket bound to one
-/// interface. Delivers full Ethernet frames, reported as `DLT_EN10MB` so
-/// `packet.rs` strips the link layer itself. The socket needs `CAP_NET_RAW`
-/// (run as root, or `setcap cap_net_raw+ep` on the binary). Both directions are
-/// captured: `AF_PACKET` sees outbound frames as well as inbound, which is what
-/// the Windows `RCVALL_IPLEVEL` path also relies on.
-#[cfg(target_os = "linux")]
-mod linux {
-    use std::os::raw::c_int;
-    use std::os::unix::io::RawFd;
-
-    use anyhow::{anyhow, bail, Context, Result};
-
-    use crate::capture_backend::{Device, Packet};
-    use crate::packet::DLT_EN10MB;
-
-    // Generous: a single GRO/LSO-coalesced frame on the wire can far exceed the
-    // 1500-byte MTU, and a short read silently truncates the segment.
-    const RECV_BUF: usize = 256 * 1024;
-
-    fn eth_p_all() -> u16 {
-        (libc::ETH_P_ALL as u16).to_be()
-    }
-
-    pub struct RawSock;
-
-    impl RawSock {
-        pub fn load() -> Result<Self> {
-            Ok(RawSock)
-        }
-
-        pub fn list_devices(&self) -> Result<Vec<Device>> {
-            let mut devices = Vec::new();
-            let entries = std::fs::read_dir("/sys/class/net")
-                .context("listing /sys/class/net network interfaces")?;
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name == "lo" {
-                    continue;
-                }
-                let operstate = std::fs::read_to_string(entry.path().join("operstate"))
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_default();
-                // Include the interface name: the picker shows `description`
-                // when present, so a bare "link up" would hide which NIC it is
-                // (every live interface would read identically).
-                let description = match operstate.as_str() {
-                    "" | "unknown" => None,
-                    other => Some(format!("{name} (link {other})")),
-                };
-                // Prefer up/unknown links first so the picker's default is live.
-                let up = matches!(operstate.as_str(), "up" | "unknown" | "");
-                devices.push((up, Device { name, description }));
-            }
-            devices.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
-            Ok(devices.into_iter().map(|(_, device)| device).collect())
-        }
-
-        pub fn open_live(&self, name: &str) -> Result<Capture> {
-            let ifindex = if_index(name)?;
-            let fd =
-                unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, i32::from(eth_p_all())) };
-            if fd < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EPERM) {
-                    bail!(
-                        "opening AF_PACKET socket needs CAP_NET_RAW — run as root, or \
-                         `sudo setcap cap_net_raw+ep` on the binary"
-                    );
-                }
-                return Err(err).context("opening AF_PACKET socket");
-            }
-            let capture = Capture {
-                fd,
-                buf: vec![0u8; RECV_BUF],
-            };
-
-            let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-            addr.sll_family = libc::AF_PACKET as u16;
-            addr.sll_protocol = eth_p_all();
-            addr.sll_ifindex = ifindex;
-            let rc = unsafe {
-                libc::bind(
-                    fd,
-                    &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-                )
-            };
-            if rc < 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("binding capture socket to {name}"));
-            }
-
-            // Non-blocking so the capture loop can poll for the stop flag.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-            {
-                return Err(std::io::Error::last_os_error())
-                    .context("setting capture socket non-blocking");
-            }
-
-            Ok(capture)
-        }
-    }
-
-    pub struct Capture {
-        fd: RawFd,
-        // Reused across reads: a 256 KiB zeroed allocation per frame would churn
-        // the allocator at gameplay packet rates.
-        buf: Vec<u8>,
-    }
-
-    impl Capture {
-        pub fn next_packet(&mut self) -> Result<Option<Packet>> {
-            // Wait for a frame with a bounded timeout rather than spinning: the
-            // capture loop calls this back-to-back, and the socket is
-            // non-blocking, so a bare `recv` would busy-loop at 100% CPU while
-            // idle. The 200 ms cap still lets the loop service its 500 ms/1 s
-            // housekeeping timers and the stop flag promptly.
-            let mut pfd = libc::pollfd {
-                fd: self.fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
-            if ready <= 0 {
-                // 0 = timeout; <0 with EINTR = interrupted. Either way, no frame.
-                return Ok(None);
-            }
-
-            let n = unsafe {
-                libc::recv(
-                    self.fd,
-                    self.buf.as_mut_ptr() as *mut libc::c_void,
-                    self.buf.len(),
-                    0,
-                )
-            };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                return match err.raw_os_error() {
-                    Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(None),
-                    _ => Err(err).context("reading from capture socket"),
-                };
-            }
-            let captured = n as usize;
-            Ok(Some(Packet {
-                timestamp_us: now_micros(),
-                captured_len: captured as u32,
-                original_len: captured as u32,
-                data: self.buf[..captured].to_vec(),
-            }))
-        }
-
-        pub fn datalink(&self) -> Result<i32> {
-            Ok(DLT_EN10MB)
-        }
-
-        pub fn set_filter(&mut self, _expression: &str) -> Result<()> {
-            // No kernel BPF: the socket captures every frame on the interface and
-            // `packet.rs` discards anything that isn't TCP/443. A busy link costs
-            // some extra userspace parsing, but keeps the backend dependency-free
-            // and correct for VLAN-tagged and offloaded frames.
-            Ok(())
-        }
-    }
-
-    impl Drop for Capture {
-        fn drop(&mut self) {
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
-    }
-
-    fn if_index(name: &str) -> Result<c_int> {
-        let cname = std::ffi::CString::new(name)
-            .map_err(|_| anyhow!("interface name {name:?} contains a NUL byte"))?;
-        let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-        if index == 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("resolving interface index for {name}"));
-        }
-        Ok(index as c_int)
-    }
-
-    fn now_micros() -> i64 {
-        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-        if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } != 0 {
-            return 0;
-        }
-        ts.tv_sec as i64 * 1_000_000 + ts.tv_nsec as i64 / 1_000
-    }
-}
-
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(not(windows))]
 mod stub {
     use anyhow::{bail, Result};
 

@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::capture_backend::CaptureMethod;
 use crate::launch::LauncherPlatform;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,12 +17,12 @@ pub struct AppConfig {
     /// Windows" — resolution falls back to the system UI language.
     #[serde(default)]
     pub language: Option<String>,
+    /// Whether to launch ARCTracker Sync at Windows sign-in (HKCU Run entry).
+    #[serde(default)]
+    pub start_with_windows: bool,
     /// Whether closing the window hides to tray instead of quitting (default on).
     #[serde(default = "default_keep_in_tray")]
     pub keep_in_tray: bool,
-    /// Packet-capture backend. Raw sockets unless the user opts into Npcap.
-    #[serde(default)]
-    pub capture_method: CaptureMethod,
 }
 
 fn default_keep_in_tray() -> bool {
@@ -37,8 +36,8 @@ impl Default for AppConfig {
             game_executable_path: None,
             platform: LauncherPlatform::default(),
             language: None,
+            start_with_windows: false,
             keep_in_tray: default_keep_in_tray(),
-            capture_method: CaptureMethod::default(),
         }
     }
 }
@@ -96,16 +95,19 @@ pub fn app_owned_sync_key_path() -> Result<PathBuf> {
     Ok(dirs.data_local_dir().join("sync-key.log"))
 }
 
-/// Delete the app-owned TLS sync-key file. The secrets in it can decrypt all
-/// of the user's port-443 traffic, so it must not outlive the capture session.
-/// User-set Process/Registry SSLKEYLOGFILE sources are never touched. A
-/// missing file is success.
+/// Delete the app-owned TLS sync-key file. The game writes pre-master secrets
+/// there, which can decrypt all of the user's port-443 traffic, so we don't
+/// leave it on disk past the capture session that needs it. Only the app-owned
+/// path is touched — user-set Process/Registry SSLKEYLOGFILE sources are never
+/// modified. A missing file is success (nothing to clear).
 pub fn clear_app_owned_sync_key() -> Result<()> {
     let path = app_owned_sync_key_path()?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("deleting sync key {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("deleting sync key {}", path.display()))
+        }
     }
 }
 
@@ -126,23 +128,7 @@ fn read_sync_key_path_from_registry() -> Option<PathBuf> {
     None
 }
 
-#[cfg(target_os = "linux")]
-fn read_steam_install_path() -> Option<PathBuf> {
-    // Steam on Linux installs under a couple of well-known locations; the
-    // `~/.steam/steam` symlink points at whichever is live. Return the first
-    // that holds a steamapps directory so library discovery works.
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let candidates = [
-        home.join(".steam/steam"),
-        home.join(".local/share/Steam"),
-        home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
-    ];
-    candidates
-        .into_iter()
-        .find(|path| path.join("steamapps").is_dir())
-}
-
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(not(windows))]
 fn read_steam_install_path() -> Option<PathBuf> {
     None
 }
@@ -309,8 +295,8 @@ mod tests {
             game_executable_path: Some(PathBuf::from("F:\\Games\\PioneerGame.exe")),
             platform: LauncherPlatform::Steam,
             language: Some("de".to_string()),
+            start_with_windows: true,
             keep_in_tray: false,
-            capture_method: CaptureMethod::Npcap,
         };
 
         let json = serde_json::to_string(&config).expect("serialize config");
@@ -322,8 +308,8 @@ mod tests {
         );
         assert_eq!(decoded.platform, LauncherPlatform::Steam);
         assert_eq!(decoded.language.as_deref(), Some("de"));
+        assert!(decoded.start_with_windows);
         assert!(!decoded.keep_in_tray);
-        assert_eq!(decoded.capture_method, CaptureMethod::Npcap);
     }
 
     #[test]
@@ -333,7 +319,7 @@ mod tests {
         // A legacy config without the new fields keeps the tray on by default.
         let legacy: AppConfig = serde_json::from_str("{}").expect("deserialize legacy config");
         assert!(legacy.keep_in_tray);
+        assert!(!legacy.start_with_windows);
         assert!(legacy.language.is_none());
-        assert_eq!(legacy.capture_method, CaptureMethod::RawSocket);
     }
 }

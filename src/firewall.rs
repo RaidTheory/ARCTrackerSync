@@ -6,6 +6,8 @@
 //! inbound "allow" rule scoped to our own executable — equivalent to turning the
 //! firewall off, but only for this program.
 
+/// Name of the inbound netsh rule. Shared by add and remove so they always
+/// target the same rule.
 #[cfg(windows)]
 const RULE_NAME: &str = "ARCTracker Sync (capture)";
 
@@ -51,9 +53,10 @@ pub fn ensure_capture_allowed() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Delete the rule added by `ensure_capture_allowed`, so the firewall
-/// allowance does not outlive the app. netsh exits non-zero when the rule is
-/// already gone; that is ignored.
+/// Delete the inbound rule added by `ensure_capture_allowed`. Called on graceful
+/// shutdown so the firewall allowance does not outlive the app. A missing rule
+/// (already removed, or never added) is not an error — netsh exits non-zero in
+/// that case, which we ignore.
 #[cfg(windows)]
 pub fn remove_capture_rule() {
     use std::os::windows::process::CommandExt;
