@@ -54,11 +54,54 @@ TCP/443 segments over 5 seconds. Non-zero TCP/443 while browsing = capture works
 | `config.rs` | Steam path from `~/.steam/steam`, `~/.local/share/Steam`, Flatpak |
 | `credential_store.rs` | session token in a `0600` file in the data dir |
 
-## Caveats / unverified
+## Caveats
 
-- Whether ARC Raiders under Proton honors `SSLKEYLOGFILE` for the connection
-  ARCTracker reads has **not** been verified end-to-end on this machine — it's
-  the same assumption the Windows build relies on. If keys aren't written, no
-  decryption is possible regardless of capture.
 - Epic Games Launcher is not supported on Linux; use Steam.
 - The tray icon and single-instance lock are no-ops on Linux (GUI still runs).
+
+## Verified end-to-end
+
+ARC Raiders under Proton **does** honor `SSLKEYLOGFILE`, and a full sync has
+been confirmed on Linux (CachyOS, kernel 7.1.6, Wayland, Proton
+`cachyos-11.0-20260703-slr`): the app
+captured the gateway connection, decrypted it, and ARCTracker acknowledged the
+account. Three things were checked rather than assumed:
+
+- `lsof` on the key log shows the game's own `GameThread` holding write
+  descriptors on it, so `PioneerGame.exe` writes to the file itself rather than
+  something upstream of it doing so on its behalf. Proton's `python3` wrapper
+  and wineserver hold descriptors too, and the header line is the one CPython
+  writes, so they open it as well — which of them wrote any given secret was
+  not established, only that the game is among the writers.
+- The file accumulates TLS 1.3 secrets (`CLIENT_HANDSHAKE_TRAFFIC_SECRET`,
+  `SERVER_TRAFFIC_SECRET_0`, …) and keeps growing across a play session.
+- With capture running, the app reached its synced state and reported the
+  ARCTracker account name.
+
+Note that capture only decrypts handshakes it actually saw: keys written before
+the capture started are useless. Start the app first, then the game.
+
+## Injecting the key log per game instead of per launcher
+
+Steam's per-game **launch options** are an alternative to letting the app
+restart Steam, and they avoid killing a running Steam session:
+
+```
+SSLKEYLOGFILE=/home/you/keylog.txt %command%
+```
+
+Launch the app with the same path in its environment and it resolves the source
+as `ProcessEnv` and leaves the file alone:
+
+```bash
+SSLKEYLOGFILE=/home/you/keylog.txt ./target/release/arctracker-sync
+```
+
+Caveat: `launcher_readiness` confirms setup by reading `SSLKEYLOGFILE` out of
+the *Steam* process, and launch options never reach it — only the game inherits
+them. So the launcher step still asks to prepare Steam even though the setup is
+already working. Selecting **Direct** in Settings skips that check.
+
+A user-set key log is never truncated or deleted by the app (unlike the
+app-owned one), so remember to remove it yourself: its contents decrypt every
+TLS session the game made while it existed.
